@@ -126,6 +126,25 @@ class MarkdownEditor:
             insertbackground="black"
         )
         self.editor.pack(fill=tk.BOTH, expand=True)
+
+        # --- Syntax highlighting tags ---
+        self.editor.tag_config("hl_header", foreground="#1a56db", font=("Monaco", 14, "bold"))
+        self.editor.tag_config("hl_header2", foreground="#2563eb", font=("Monaco", 13, "bold"))
+        self.editor.tag_config("hl_header3", foreground="#3b82f6", font=("Monaco", 12, "bold"))
+        self.editor.tag_config("hl_bold", font=("Monaco", 12, "bold"))
+        self.editor.tag_config("hl_italic", font=("Monaco", 12, "italic"))
+        self.editor.tag_config("hl_code_inline", foreground="#b91c1c", background="#f1f5f9",
+                              font=("Monaco", 11))
+        self.editor.tag_config("hl_code_block", foreground="#374151", background="#f1f5f9",
+                              font=("Monaco", 11), lmargin1=10, lmargin2=10)
+        self.editor.tag_config("hl_link_text", foreground="#059669", underline=True)
+        self.editor.tag_config("hl_link_url", foreground="#6b7280", font=("Monaco", 10))
+        self.editor.tag_config("hl_image", foreground="#7c3aed")
+        self.editor.tag_config("hl_blockquote", foreground="#78716c", font=("Monaco", 12, "italic"),
+                              lmargin1=10, lmargin2=10)
+        self.editor.tag_config("hl_hr", foreground="#d1d5db")
+        self.editor.tag_config("hl_list", foreground="#0891b2", font=("Monaco", 12, "bold"))
+
         self.editor.bind("<KeyRelease>", self.on_text_change)
         self.editor.bind("<Command-n>", lambda _: self.new_file())
         self.editor.bind("<Command-o>", lambda _: self.open_file())
@@ -170,6 +189,7 @@ class MarkdownEditor:
                 self.editor.delete(1.0, tk.END)
                 self.editor.insert(tk.END, content)
                 self.current_file = file_path
+                self._highlight_syntax()
                 self.update_preview()
                 self.status_bar.config(text=f"Opened: {os.path.basename(file_path)}")
             except Exception as e:
@@ -226,6 +246,7 @@ class MarkdownEditor:
                         self.editor.delete(1.0, tk.END)
                         self.editor.insert(tk.END, content)
                         self.current_file = file_path
+                        self._highlight_syntax()
                         self.update_preview()
                         self.status_bar.config(text=f"Opened: {os.path.basename(file_path)}")
                     except Exception as e:
@@ -256,7 +277,128 @@ class MarkdownEditor:
         except Exception as e:
             self.status_bar.config(text=f"Error saving file: {e}")
 
+    def _highlight_syntax(self):
+        """Apply Markdown syntax highlighting to the editor content."""
+        content = self.editor.get("1.0", tk.END)
+
+        # Remove all previous highlight tags
+        for tag in (
+            "hl_header", "hl_header2", "hl_header3",
+            "hl_bold", "hl_italic", "hl_code_inline", "hl_code_block",
+            "hl_link_text", "hl_link_url", "hl_image",
+            "hl_blockquote", "hl_hr", "hl_list",
+        ):
+            self.editor.tag_remove(tag, "1.0", tk.END)
+
+        # --- 1. Code blocks (``` ... ```) --- must run first so we can exclude them
+        code_block_ranges = []
+        for m in re.finditer(r'```.*?\n(.*?)```', content, re.DOTALL):
+            start_idx = f"1.0 + {m.start(1)} chars"
+            end_idx = f"1.0 + {m.end(1)} chars"
+            self.editor.tag_add("hl_code_block", start_idx, end_idx)
+            code_block_ranges.append((m.start(), m.end()))
+
+        def _inside_code_block(pos):
+            for cs, ce in code_block_ranges:
+                if cs <= pos < ce:
+                    return True
+            return False
+
+        # --- 2. Block-level elements ---
+
+        # Headers (line-start # ## ### etc.)
+        for m in re.finditer(r'^(#{1,6})\s+(.+)$', content, re.MULTILINE):
+            if _inside_code_block(m.start()):
+                continue
+            level = len(m.group(1))
+            tag = {1: "hl_header", 2: "hl_header2", 3: "hl_header3"}.get(level, "hl_header3")
+            line_start = f"1.0 + {m.start()} chars"
+            line_end = f"1.0 + {m.end()} chars"
+            self.editor.tag_add(tag, line_start, line_end)
+
+        # Horizontal rules (---, ***, ___ alone on a line)
+        for m in re.finditer(r'^(\-{3,}|\*{3,}|_{3,})\s*$', content, re.MULTILINE):
+            if _inside_code_block(m.start()):
+                continue
+            line_start = f"1.0 + {m.start()} chars"
+            line_end = f"1.0 + {m.end()} chars"
+            self.editor.tag_add("hl_hr", line_start, line_end)
+
+        # Blockquotes (> at line start)
+        for m in re.finditer(r'^>\s?(.*)$', content, re.MULTILINE):
+            if _inside_code_block(m.start()):
+                continue
+            line_start = f"1.0 + {m.start()} chars"
+            line_end = f"1.0 + {m.end()} chars"
+            self.editor.tag_add("hl_blockquote", line_start, line_end)
+
+        # List markers (- or * or + at line start, followed by space)
+        for m in re.finditer(r'^(\s*)([\-\*\+])\s(?=.+)', content, re.MULTILINE):
+            if _inside_code_block(m.start()):
+                continue
+            marker_start = f"1.0 + {m.start(2)} chars"
+            marker_end = f"1.0 + {m.end(2)} chars"
+            self.editor.tag_add("hl_list", marker_start, marker_end)
+
+        # Numbered lists
+        for m in re.finditer(r'^(\s*)(\d+\.)\s(?=.+)', content, re.MULTILINE):
+            if _inside_code_block(m.start()):
+                continue
+            marker_start = f"1.0 + {m.start(2)} chars"
+            marker_end = f"1.0 + {m.end(2)} chars"
+            self.editor.tag_add("hl_list", marker_start, marker_end)
+
+        # --- 3. Inline elements ---
+
+        # Images ![alt](url) — match before links
+        for m in re.finditer(r'!\[([^\]]*)\]\(([^\)]+)\)', content):
+            if _inside_code_block(m.start()):
+                continue
+            start_idx = f"1.0 + {m.start()} chars"
+            end_idx = f"1.0 + {m.end()} chars"
+            self.editor.tag_add("hl_image", start_idx, end_idx)
+
+        # Links [text](url)
+        for m in re.finditer(r'(?<!!)\[([^\]]+)\]\(([^\)]+)\)', content):
+            if _inside_code_block(m.start()):
+                continue
+            # Link text part
+            text_start = f"1.0 + {m.start(1)} chars"
+            text_end = f"1.0 + {m.end(1)} chars"
+            self.editor.tag_add("hl_link_text", f"1.0 + {m.start()} chars", f"1.0 + {m.start(1) - 1} chars")
+            self.editor.tag_add("hl_link_text", f"1.0 + {m.end(1) + 1} chars", f"1.0 + {m.end(1) + 1 + len(m.group(2)) + 1} chars")
+            self.editor.tag_add("hl_link_text", text_start, text_end)
+            # URL part
+            url_start = f"1.0 + {m.start(2)} chars"
+            url_end = f"1.0 + {m.end(2)} chars"
+            self.editor.tag_add("hl_link_url", url_start, url_end)
+
+        # Bold **text** or __text__
+        for m in re.finditer(r'\*\*(.+?)\*\*|__(.+?)__', content):
+            if _inside_code_block(m.start()):
+                continue
+            start_idx = f"1.0 + {m.start()} chars"
+            end_idx = f"1.0 + {m.end()} chars"
+            self.editor.tag_add("hl_bold", start_idx, end_idx)
+
+        # Italic *text* or _text_ (but not ** or __)
+        for m in re.finditer(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)|(?<!_)_(?!_)(.+?)(?<!_)_(?!_)', content):
+            if _inside_code_block(m.start()):
+                continue
+            start_idx = f"1.0 + {m.start()} chars"
+            end_idx = f"1.0 + {m.end()} chars"
+            self.editor.tag_add("hl_italic", start_idx, end_idx)
+
+        # Inline code `text`
+        for m in re.finditer(r'`([^`]+)`', content):
+            if _inside_code_block(m.start()):
+                continue
+            start_idx = f"1.0 + {m.start()} chars"
+            end_idx = f"1.0 + {m.end()} chars"
+            self.editor.tag_add("hl_code_inline", start_idx, end_idx)
+
     def on_text_change(self, event=None):
+        self._highlight_syntax()
         self.update_preview()
 
     def update_preview(self):
@@ -701,6 +843,7 @@ class MarkdownEditor:
                         self.editor.delete(1.0, tk.END)
                         self.editor.insert(tk.END, content)
                         self.current_file = file_path
+                        self._highlight_syntax()
                         self.update_preview()
                         self.status_bar.config(text=f"Opened: {file_name}")
                         # Highlight and jump to first match
