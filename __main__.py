@@ -36,6 +36,14 @@ class MarkdownEditor:
 
         edit_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Edit", menu=edit_menu)
+        edit_menu.add_command(label="Undo", command=self.undo, accelerator="Cmd+Z")
+        edit_menu.add_command(label="Redo", command=self.redo, accelerator="Cmd+Shift+Z")
+        edit_menu.add_separator()
+        edit_menu.add_command(label="Cut", command=self.cut, accelerator="Cmd+X")
+        edit_menu.add_command(label="Copy", command=self.copy, accelerator="Cmd+C")
+        edit_menu.add_command(label="Paste", command=self.paste, accelerator="Cmd+V")
+        edit_menu.add_command(label="Select All", command=self.select_all, accelerator="Cmd+A")
+        edit_menu.add_separator()
         edit_menu.add_command(label="Bold", command=lambda: self.insert_format("**", "**"), accelerator="Cmd+B")
         edit_menu.add_command(label="Italic", command=lambda: self.insert_format("*", "*"), accelerator="Cmd+I")
         edit_menu.add_command(label="Heading", command=self.insert_heading, accelerator="Cmd+H")
@@ -106,7 +114,7 @@ class MarkdownEditor:
         self.file_tree.bind("<Button-3>", self.show_context_menu)
         self.file_tree.bind("<Control-Button-1>", self.show_context_menu)
 
-        # Context menu
+        # File tree context menu
         self.context_menu = tk.Menu(self.root, tearoff=0)
         self.context_menu.add_command(label="New File", command=self.new_file_in_tree)
         self.context_menu.add_command(label="New Folder", command=self.new_folder_in_tree)
@@ -116,6 +124,14 @@ class MarkdownEditor:
         self.context_menu.add_separator()
         self.context_menu.add_command(label="Delete", command=self.delete_selected)
 
+        # Editor context menu (right-click)
+        self.editor_context_menu = tk.Menu(self.root, tearoff=0)
+        self.editor_context_menu.add_command(label="Cut", command=self.cut)
+        self.editor_context_menu.add_command(label="Copy", command=self.copy)
+        self.editor_context_menu.add_command(label="Paste", command=self.paste)
+        self.editor_context_menu.add_separator()
+        self.editor_context_menu.add_command(label="Select All", command=self.select_all)
+
         ttk.Label(left_frame, text="Editor", font=("Helvetica", 10, "bold")).pack(anchor="w")
 
         self.editor = scrolledtext.ScrolledText(
@@ -123,27 +139,12 @@ class MarkdownEditor:
             wrap=tk.WORD,
             font=("Monaco", 12),
             tabstyle="wordprocessor",
-            insertbackground="black"
+            insertbackground="black",
+            undo=True,
+            autoseparators=True,
+            maxundo=-1
         )
         self.editor.pack(fill=tk.BOTH, expand=True)
-
-        # --- Syntax highlighting tags ---
-        self.editor.tag_config("hl_header", foreground="#1a56db", font=("Monaco", 14, "bold"))
-        self.editor.tag_config("hl_header2", foreground="#2563eb", font=("Monaco", 13, "bold"))
-        self.editor.tag_config("hl_header3", foreground="#3b82f6", font=("Monaco", 12, "bold"))
-        self.editor.tag_config("hl_bold", font=("Monaco", 12, "bold"))
-        self.editor.tag_config("hl_italic", font=("Monaco", 12, "italic"))
-        self.editor.tag_config("hl_code_inline", foreground="#b91c1c", background="#f1f5f9",
-                              font=("Monaco", 11))
-        self.editor.tag_config("hl_code_block", foreground="#374151", background="#f1f5f9",
-                              font=("Monaco", 11), lmargin1=10, lmargin2=10)
-        self.editor.tag_config("hl_link_text", foreground="#059669", underline=True)
-        self.editor.tag_config("hl_link_url", foreground="#6b7280", font=("Monaco", 10))
-        self.editor.tag_config("hl_image", foreground="#7c3aed")
-        self.editor.tag_config("hl_blockquote", foreground="#78716c", font=("Monaco", 12, "italic"),
-                              lmargin1=10, lmargin2=10)
-        self.editor.tag_config("hl_hr", foreground="#d1d5db")
-        self.editor.tag_config("hl_list", foreground="#0891b2", font=("Monaco", 12, "bold"))
 
         self.editor.bind("<KeyRelease>", self.on_text_change)
         self.editor.bind("<Command-n>", lambda _: self.new_file())
@@ -160,6 +161,12 @@ class MarkdownEditor:
         self.editor.bind("<Command-backslash>", lambda _: self.toggle_preview())
         self.editor.bind("<Command-f>", lambda _: self.show_find_dialog())
         self.editor.bind("<Command-Shift-f>", lambda _: self.show_search_dialog())
+        self.editor.bind("<Command-a>", lambda _: self.select_all())
+        self.editor.bind("<Command-z>", lambda _: self.undo())
+        self.editor.bind("<Command-Shift-Z>", lambda _: self.redo())
+        self.editor.bind("<Button-2>", self.show_editor_context_menu)
+        self.editor.bind("<Button-3>", self.show_editor_context_menu)
+        self.editor.bind("<Control-Button-1>", self.show_editor_context_menu)
 
         ttk.Label(right_frame, text="Preview", font=("Helvetica", 10, "bold")).pack(anchor="w")
 
@@ -189,7 +196,6 @@ class MarkdownEditor:
                 self.editor.delete(1.0, tk.END)
                 self.editor.insert(tk.END, content)
                 self.current_file = file_path
-                self._highlight_syntax()
                 self.update_preview()
                 self.status_bar.config(text=f"Opened: {os.path.basename(file_path)}")
             except Exception as e:
@@ -246,7 +252,6 @@ class MarkdownEditor:
                         self.editor.delete(1.0, tk.END)
                         self.editor.insert(tk.END, content)
                         self.current_file = file_path
-                        self._highlight_syntax()
                         self.update_preview()
                         self.status_bar.config(text=f"Opened: {os.path.basename(file_path)}")
                     except Exception as e:
@@ -277,128 +282,7 @@ class MarkdownEditor:
         except Exception as e:
             self.status_bar.config(text=f"Error saving file: {e}")
 
-    def _highlight_syntax(self):
-        """Apply Markdown syntax highlighting to the editor content."""
-        content = self.editor.get("1.0", tk.END)
-
-        # Remove all previous highlight tags
-        for tag in (
-            "hl_header", "hl_header2", "hl_header3",
-            "hl_bold", "hl_italic", "hl_code_inline", "hl_code_block",
-            "hl_link_text", "hl_link_url", "hl_image",
-            "hl_blockquote", "hl_hr", "hl_list",
-        ):
-            self.editor.tag_remove(tag, "1.0", tk.END)
-
-        # --- 1. Code blocks (``` ... ```) --- must run first so we can exclude them
-        code_block_ranges = []
-        for m in re.finditer(r'```.*?\n(.*?)```', content, re.DOTALL):
-            start_idx = f"1.0 + {m.start(1)} chars"
-            end_idx = f"1.0 + {m.end(1)} chars"
-            self.editor.tag_add("hl_code_block", start_idx, end_idx)
-            code_block_ranges.append((m.start(), m.end()))
-
-        def _inside_code_block(pos):
-            for cs, ce in code_block_ranges:
-                if cs <= pos < ce:
-                    return True
-            return False
-
-        # --- 2. Block-level elements ---
-
-        # Headers (line-start # ## ### etc.)
-        for m in re.finditer(r'^(#{1,6})\s+(.+)$', content, re.MULTILINE):
-            if _inside_code_block(m.start()):
-                continue
-            level = len(m.group(1))
-            tag = {1: "hl_header", 2: "hl_header2", 3: "hl_header3"}.get(level, "hl_header3")
-            line_start = f"1.0 + {m.start()} chars"
-            line_end = f"1.0 + {m.end()} chars"
-            self.editor.tag_add(tag, line_start, line_end)
-
-        # Horizontal rules (---, ***, ___ alone on a line)
-        for m in re.finditer(r'^(\-{3,}|\*{3,}|_{3,})\s*$', content, re.MULTILINE):
-            if _inside_code_block(m.start()):
-                continue
-            line_start = f"1.0 + {m.start()} chars"
-            line_end = f"1.0 + {m.end()} chars"
-            self.editor.tag_add("hl_hr", line_start, line_end)
-
-        # Blockquotes (> at line start)
-        for m in re.finditer(r'^>\s?(.*)$', content, re.MULTILINE):
-            if _inside_code_block(m.start()):
-                continue
-            line_start = f"1.0 + {m.start()} chars"
-            line_end = f"1.0 + {m.end()} chars"
-            self.editor.tag_add("hl_blockquote", line_start, line_end)
-
-        # List markers (- or * or + at line start, followed by space)
-        for m in re.finditer(r'^(\s*)([\-\*\+])\s(?=.+)', content, re.MULTILINE):
-            if _inside_code_block(m.start()):
-                continue
-            marker_start = f"1.0 + {m.start(2)} chars"
-            marker_end = f"1.0 + {m.end(2)} chars"
-            self.editor.tag_add("hl_list", marker_start, marker_end)
-
-        # Numbered lists
-        for m in re.finditer(r'^(\s*)(\d+\.)\s(?=.+)', content, re.MULTILINE):
-            if _inside_code_block(m.start()):
-                continue
-            marker_start = f"1.0 + {m.start(2)} chars"
-            marker_end = f"1.0 + {m.end(2)} chars"
-            self.editor.tag_add("hl_list", marker_start, marker_end)
-
-        # --- 3. Inline elements ---
-
-        # Images ![alt](url) — match before links
-        for m in re.finditer(r'!\[([^\]]*)\]\(([^\)]+)\)', content):
-            if _inside_code_block(m.start()):
-                continue
-            start_idx = f"1.0 + {m.start()} chars"
-            end_idx = f"1.0 + {m.end()} chars"
-            self.editor.tag_add("hl_image", start_idx, end_idx)
-
-        # Links [text](url)
-        for m in re.finditer(r'(?<!!)\[([^\]]+)\]\(([^\)]+)\)', content):
-            if _inside_code_block(m.start()):
-                continue
-            # Link text part
-            text_start = f"1.0 + {m.start(1)} chars"
-            text_end = f"1.0 + {m.end(1)} chars"
-            self.editor.tag_add("hl_link_text", f"1.0 + {m.start()} chars", f"1.0 + {m.start(1) - 1} chars")
-            self.editor.tag_add("hl_link_text", f"1.0 + {m.end(1) + 1} chars", f"1.0 + {m.end(1) + 1 + len(m.group(2)) + 1} chars")
-            self.editor.tag_add("hl_link_text", text_start, text_end)
-            # URL part
-            url_start = f"1.0 + {m.start(2)} chars"
-            url_end = f"1.0 + {m.end(2)} chars"
-            self.editor.tag_add("hl_link_url", url_start, url_end)
-
-        # Bold **text** or __text__
-        for m in re.finditer(r'\*\*(.+?)\*\*|__(.+?)__', content):
-            if _inside_code_block(m.start()):
-                continue
-            start_idx = f"1.0 + {m.start()} chars"
-            end_idx = f"1.0 + {m.end()} chars"
-            self.editor.tag_add("hl_bold", start_idx, end_idx)
-
-        # Italic *text* or _text_ (but not ** or __)
-        for m in re.finditer(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)|(?<!_)_(?!_)(.+?)(?<!_)_(?!_)', content):
-            if _inside_code_block(m.start()):
-                continue
-            start_idx = f"1.0 + {m.start()} chars"
-            end_idx = f"1.0 + {m.end()} chars"
-            self.editor.tag_add("hl_italic", start_idx, end_idx)
-
-        # Inline code `text`
-        for m in re.finditer(r'`([^`]+)`', content):
-            if _inside_code_block(m.start()):
-                continue
-            start_idx = f"1.0 + {m.start()} chars"
-            end_idx = f"1.0 + {m.end()} chars"
-            self.editor.tag_add("hl_code_inline", start_idx, end_idx)
-
     def on_text_change(self, event=None):
-        self._highlight_syntax()
         self.update_preview()
 
     def update_preview(self):
@@ -521,6 +405,55 @@ class MarkdownEditor:
             self.editor.insert(sel_start, f"[{selected}](url)")
         except:
             self.editor.insert(tk.INSERT, "[text](url)")
+
+    def undo(self):
+        """Undo last edit operation"""
+        try:
+            self.editor.edit_undo()
+        except tk.TclError:
+            pass
+
+    def redo(self):
+        """Redo last undone operation"""
+        try:
+            self.editor.edit_redo()
+        except tk.TclError:
+            pass
+
+    def cut(self):
+        """Cut selected text to clipboard"""
+        try:
+            self.editor.event_generate("<<Cut>>")
+        except tk.TclError:
+            pass
+
+    def copy(self):
+        """Copy selected text to clipboard"""
+        try:
+            self.editor.event_generate("<<Copy>>")
+        except tk.TclError:
+            pass
+
+    def paste(self):
+        """Paste text from clipboard"""
+        try:
+            self.editor.event_generate("<<Paste>>")
+        except tk.TclError:
+            pass
+
+    def select_all(self):
+        """Select all text in the editor"""
+        self.editor.tag_add(tk.SEL, "1.0", tk.END)
+        self.editor.mark_set(tk.INSERT, "1.0")
+        self.editor.see(tk.INSERT)
+        return "break"
+
+    def show_editor_context_menu(self, event):
+        """Show right-click context menu on the editor"""
+        try:
+            self.editor_context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.editor_context_menu.grab_release()
 
     def get_selected_path(self):
         selection = self.file_tree.selection()
@@ -843,7 +776,6 @@ class MarkdownEditor:
                         self.editor.delete(1.0, tk.END)
                         self.editor.insert(tk.END, content)
                         self.current_file = file_path
-                        self._highlight_syntax()
                         self.update_preview()
                         self.status_bar.config(text=f"Opened: {file_name}")
                         # Highlight and jump to first match
@@ -896,10 +828,11 @@ class MarkdownEditor:
             cwd = self.current_folder
         try:
             result = subprocess.run(
-                ['git'] + args,
+                ['git', '-c', 'core.quotePath=false'] + args,
                 cwd=cwd,
                 capture_output=True,
-                text=True,
+                encoding='utf-8',
+                errors='replace',
                 timeout=30
             )
             return result.returncode, result.stdout, result.stderr
@@ -957,9 +890,10 @@ class MarkdownEditor:
             # Clone repository
             try:
                 result = subprocess.run(
-                    ['git', 'clone', url, dest],
+                    ['git', '-c', 'core.quotePath=false', 'clone', url, dest],
                     capture_output=True,
-                    text=True,
+                    encoding='utf-8',
+                    errors='replace',
                     timeout=120
                 )
 
