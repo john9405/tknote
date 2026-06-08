@@ -132,6 +132,7 @@ class TabbedEditor(ttk.Frame):
 
         if content:
             editor.insert(tk.END, content)
+            editor.edit_modified(False)  # reset after initial load
 
         # For plain text files: hide the preview button and pane
         if file_type == 'txt':
@@ -171,17 +172,23 @@ class TabbedEditor(ttk.Frame):
         if index < 0 or index >= len(self._tabs):
             return False
 
+        was_active = (index == self._active_index)
         tab = self._tabs[index]
         tab['frame'].destroy()
         self._tabs.pop(index)
 
-        # Adjust active index
-        if self._active_index >= len(self._tabs):
-            self._active_index = len(self._tabs) - 1
-
         if self._tabs:
-            # Switch to nearest remaining tab
-            new_idx = max(0, min(index, len(self._tabs) - 1))
+            if was_active:
+                # Active tab was closed — pick the nearest remaining tab
+                new_idx = max(0, min(index, len(self._tabs) - 1))
+            else:
+                # Non-active tab closed — keep the active tab active
+                if index < self._active_index:
+                    self._active_index -= 1  # shift down
+                new_idx = self._active_index
+
+            # Invalidate so switch_to_tab won't skip the re-pack
+            self._active_index = -1
             self.switch_to_tab(new_idx)
         else:
             self._active_index = -1
@@ -391,8 +398,8 @@ class TabbedEditor(ttk.Frame):
                 fill='#222222' if is_active else '#444444'
             )
 
-            # Store tab hit rect
-            self._tab_rects.append((x, y, x + tab_w, y + h, i))
+            # Store tab hit rect (with tab_id, not index)
+            self._tab_rects.append((x, y, x + tab_w, y + h, tab['id']))
 
             # Close button (×)
             cx = x + tab_w - self.CLOSE_SIZE // 2 - 4
@@ -404,7 +411,7 @@ class TabbedEditor(ttk.Frame):
             )
             self._close_rects.append((
                 cx - self.CLOSE_SIZE // 2 - 1, y + 2,
-                cx + self.CLOSE_SIZE // 2 + 1, y + h - 2, i
+                cx + self.CLOSE_SIZE // 2 + 1, y + h - 2, tab['id']
             ))
 
             x += tab_w + 2
@@ -428,17 +435,18 @@ class TabbedEditor(ttk.Frame):
         y = event.y
 
         # Check close buttons first (higher priority)
-        for rx1, ry1, rx2, ry2, idx in reversed(self._close_rects):
+        for rx1, ry1, rx2, ry2, tab_id in reversed(self._close_rects):
             if rx1 <= x <= rx2 and ry1 <= y <= ry2:
                 if self._on_close_request:
-                    self._on_close_request(self._tabs[idx]['id'])
+                    self._on_close_request(tab_id)
                 return
 
         # Check tab rectangles for selection
-        for rx1, ry1, rx2, ry2, idx in reversed(self._tab_rects):
+        for rx1, ry1, rx2, ry2, tab_id in reversed(self._tab_rects):
             if rx1 <= x <= rx2 and ry1 <= y <= ry2:
-                if idx != self._active_index:
-                    self.switch_to_tab(idx)
+                tab_idx = self.get_tab_index(tab_id)
+                if tab_idx >= 0 and tab_idx != self._active_index:
+                    self.switch_to_tab(tab_idx)
                 return
 
     def _on_mousewheel(self, event):
@@ -612,19 +620,50 @@ class MarkdownEditor:
 
         self.git_status_text = tk.Text(
             git_status_frame, height=10, font=("Monaco", 10),
-            yscrollcommand=git_status_scroll.set, state=tk.DISABLED
+            yscrollcommand=git_status_scroll.set, state=tk.DISABLED,
+            cursor='hand2'
         )
         self.git_status_text.pack(fill=tk.BOTH, expand=True)
+        self.git_status_text.bind('<Double-Button-1>', self._on_git_status_double_click)
+        self.git_status_text.bind('<Button-2>', self._on_git_status_right_click)
+        self.git_status_text.bind('<Button-3>', self._on_git_status_right_click)
+        self.git_status_text.bind('<Control-Button-1>', self._on_git_status_right_click)
         git_status_scroll.config(command=self.git_status_text.yview)
+
+        # Git status context menu
+        self._git_context_menu = tk.Menu(self.root, tearoff=0)
+        self._git_context_menu.add_command(label="Rollback", command=self._git_rollback)
+        self._git_context_menu.add_command(label="Open File", command=self._git_open_selected)
+        self._git_context_menu.add_command(label="Show Diff", command=self._git_show_diff)
+        self._git_right_clicked_file = None
 
         git_btn_frame = ttk.Frame(self.git_panel_frame)
         git_btn_frame.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Button(git_btn_frame, text="Clone", command=self.git_clone).pack(side=tk.LEFT, padx=1)
-        ttk.Button(git_btn_frame, text="Init", command=self.git_init).pack(side=tk.LEFT, padx=1)
-        ttk.Button(git_btn_frame, text="Commit", command=self.git_commit).pack(side=tk.LEFT, padx=1)
-        ttk.Button(git_btn_frame, text="Push", command=self.git_push).pack(side=tk.LEFT, padx=1)
-        ttk.Button(git_btn_frame, text="Pull", command=self.git_pull).pack(side=tk.LEFT, padx=1)
-        ttk.Button(git_btn_frame, text="Refresh", command=self._refresh_git_panel).pack(side=tk.RIGHT, padx=1)
+        # Store button references for show/hide control
+        self._git_btns = {}
+        # Row 0: repository setup
+        self._git_btns['clone'] = ttk.Button(git_btn_frame, text="Clone", command=self.git_clone)
+        self._git_btns['clone'].grid(row=0, column=0, padx=1, pady=1, sticky='ew')
+        self._git_btns['init'] = ttk.Button(git_btn_frame, text="Init", command=self.git_init)
+        self._git_btns['init'].grid(row=0, column=1, padx=1, pady=1, sticky='ew')
+        # Row 1: remote + commit
+        self._git_btns['remote'] = ttk.Button(git_btn_frame, text="Remote", command=self.git_set_remote)
+        self._git_btns['remote'].grid(row=1, column=0, padx=1, pady=1, sticky='ew')
+        self._git_btns['commit'] = ttk.Button(git_btn_frame, text="Commit", command=self.git_commit)
+        self._git_btns['commit'].grid(row=1, column=1, padx=1, pady=1, sticky='ew')
+        # Row 2: push + pull
+        self._git_btns['push'] = ttk.Button(git_btn_frame, text="Push", command=self.git_push)
+        self._git_btns['push'].grid(row=2, column=0, padx=1, pady=1, sticky='ew')
+        self._git_btns['pull'] = ttk.Button(git_btn_frame, text="Pull", command=self.git_pull)
+        self._git_btns['pull'].grid(row=2, column=1, padx=1, pady=1, sticky='ew')
+        # Row 3: log + refresh
+        self._git_btns['log'] = ttk.Button(git_btn_frame, text="Log", command=self.show_git_log)
+        self._git_btns['log'].grid(row=3, column=0, padx=1, pady=1, sticky='ew')
+        self._git_btns['refresh'] = ttk.Button(git_btn_frame, text="Refresh", command=self._refresh_git_panel)
+        self._git_btns['refresh'].grid(row=3, column=1, padx=1, pady=1, sticky='ew')
+        git_btn_frame.columnconfigure(0, weight=1)
+        git_btn_frame.columnconfigure(1, weight=1)
+        self._update_git_buttons()
 
         # Show file tree by default
         self.file_tree_frame.pack(fill=tk.BOTH, expand=True)
@@ -640,8 +679,8 @@ class MarkdownEditor:
         self.tabbed_editor.pack(fill=tk.BOTH, expand=True)
 
         # -- Status bar --
-        self.status_bar = ttk.Label(main_frame, text="Ready", relief=tk.SUNKEN, anchor="w")
-        self.status_bar.pack(fill=tk.X, side=tk.BOTTOM)
+        self.status_bar = ttk.Label(self.root, text="Ready", relief=tk.SUNKEN, anchor="w")
+        self.status_bar.pack(fill=tk.X, side=tk.BOTTOM, padx=8)
 
     # ---- Shortcut binding for new editors ----------------------------------
 
@@ -744,6 +783,7 @@ class MarkdownEditor:
             self.git_status_text.delete(1.0, tk.END)
             self.git_status_text.insert(tk.END, "Open a folder to see git status.")
             self.git_status_text.config(state=tk.DISABLED)
+            self._update_git_buttons()
             return
 
         _, branch, _ = self.run_git_command(['branch', '--show-current'])
@@ -758,6 +798,146 @@ class MarkdownEditor:
         else:
             self.git_status_text.insert(tk.END, "Working tree clean")
         self.git_status_text.config(state=tk.DISABLED)
+        self._update_git_buttons()
+
+    def _parse_git_status_line(self, event):
+        """Extract (rel_path, file_path) from a click on the git status text."""
+        if not self.current_folder:
+            return None, None
+        idx = self.git_status_text.index(f'@{event.x},{event.y}')
+        line_text = self.git_status_text.get(f'{idx} linestart', f'{idx} lineend')
+        if not line_text.strip() or len(line_text) <= 3 or '->' in line_text:
+            return None, None
+        rel_path = line_text[3:].strip()
+        return rel_path, os.path.join(self.current_folder, rel_path)
+
+    def _on_git_status_double_click(self, event):
+        """Show git diff for a file double-clicked in the git status panel."""
+        rel_path, file_path = self._parse_git_status_line(event)
+        if rel_path is None:
+            return
+        self._show_diff_for(rel_path)
+
+    def _on_git_status_right_click(self, event):
+        """Show context menu on right-click in git status panel."""
+        rel_path, file_path = self._parse_git_status_line(event)
+        self._git_right_clicked_file = (rel_path, file_path)
+        try:
+            self._git_context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self._git_context_menu.grab_release()
+
+    def _git_rollback(self):
+        """Discard changes to the selected file (git checkout -- <file>)."""
+        info = self._git_right_clicked_file
+        if not info or not info[0] or not info[1]:
+            return
+        rel_path, file_path = info
+        name = os.path.basename(rel_path)
+        confirm = messagebox.askyesno(
+            "Rollback Changes",
+            f"Discard all changes to '{name}'?\n\nThis cannot be undone.",
+            parent=self.root
+        )
+        if confirm:
+            rc, _, stderr = self.run_git_command(['checkout', '--', rel_path])
+            if rc == 0:
+                self.status_bar.config(text=f"Rolled back: {name}")
+                self._refresh_git_panel()
+                # Update any open tab of this file with reverted content
+                tab_idx = self.tabbed_editor.find_tab_by_path(file_path)
+                if tab_idx >= 0:
+                    try:
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            new_content = f.read()
+                        tab = self.tabbed_editor._tabs[tab_idx]
+                        editor = tab['editor']
+                        # Unbind the <<Modified>> handler so the
+                        # programmatic delete/insert don't flag the
+                        # tab as modified.  Also disable undo so the
+                        # replacement isn't recorded in the undo stack.
+                        editor.unbind('<<Modified>>')
+                        editor.configure(undo=False)
+                        editor.delete(1.0, tk.END)
+                        editor.insert(tk.END, new_content)
+                        editor.edit_reset()
+                        editor.configure(undo=True)
+                        # Re-bind the handler that was set in add_tab()
+                        editor.bind('<<Modified>>',
+                            lambda e, tid=tab['id']: self.tabbed_editor._on_editor_modified(tid, e))
+                        self.tabbed_editor.set_tab_modified(tab['id'], False)
+                        if tab_idx == self.tabbed_editor.get_active_index():
+                            self.update_preview()
+                    except Exception as e:
+                        self.status_bar.config(text=f"Error reloading file: {e}")
+                # Close diff tab for this file
+                diff_title = f'Diff: {name}'
+                for i, tab in enumerate(self.tabbed_editor._tabs):
+                    if tab['title'] == diff_title:
+                        tab['modified'] = False
+                        self.tabbed_editor.close_tab(i)
+                        break
+            else:
+                self.status_bar.config(text=f"Rollback failed: {stderr.strip()}")
+
+    def _git_open_selected(self):
+        """Open the right-clicked file in an editor tab."""
+        info = self._git_right_clicked_file
+        if info and info[0]:
+            rel_path, file_path = info
+            if os.path.isfile(file_path):
+                self._open_file_in_tab(file_path)
+
+    def _git_show_diff(self):
+        """Show git diff for the right-clicked file."""
+        info = self._git_right_clicked_file
+        if info and info[0]:
+            self._show_diff_for(info[0])
+
+    def _show_diff_for(self, rel_path):
+        """Create a tab showing git diff for the given relative path."""
+        _, diff, _ = self.run_git_command(['diff', '--', rel_path])
+        if not diff.strip():
+            _, diff, _ = self.run_git_command(['diff', '--cached', '--', rel_path])
+
+        title = f'Diff: {os.path.basename(rel_path)}'
+        content = diff if diff.strip() else '(no changes)'
+        # Check if a diff tab already exists for this file
+        for i, tab in enumerate(self.tabbed_editor._tabs):
+            if tab['title'] == title:
+                self.tabbed_editor.switch_to_tab(i)
+                # Update content
+                tab['editor'].delete(1.0, tk.END)
+                tab['editor'].insert(tk.END, content)
+                tab['editor'].edit_modified(False)
+                return
+        self.tabbed_editor.add_tab(title=title, content=content, file_type='txt')
+
+    def _update_git_buttons(self):
+        """Show/hide git buttons based on current state."""
+        folder_open = self.current_folder is not None
+        has_git = False
+        if folder_open:
+            has_git = os.path.isdir(os.path.join(self.current_folder, '.git'))
+
+        # Clone: only visible when no folder is open
+        if folder_open:
+            self._git_btns['clone'].grid_remove()
+        else:
+            self._git_btns['clone'].grid()
+
+        # Init: visible only when folder is open AND no .git exists
+        if folder_open and not has_git:
+            self._git_btns['init'].grid()
+        else:
+            self._git_btns['init'].grid_remove()
+
+        # All other buttons: visible only when folder is open
+        for name in ('remote', 'commit', 'push', 'pull', 'log', 'refresh'):
+            if folder_open:
+                self._git_btns[name].grid()
+            else:
+                self._git_btns[name].grid_remove()
 
     # ---- File opening helpers ----------------------------------------------
 
@@ -833,6 +1013,7 @@ class MarkdownEditor:
             self.current_folder = folder_path
             self.populate_file_tree(folder_path)
             self.status_bar.config(text=f"Opened folder: {os.path.basename(folder_path)}")
+            self._update_git_buttons()
 
     def populate_file_tree(self, folder_path):
         self.file_tree.delete(*self.file_tree.get_children())
@@ -1543,6 +1724,7 @@ class MarkdownEditor:
                     self.current_folder = dest
                     self.populate_file_tree(dest)
                     self.status_bar.config(text=f"Opened: {os.path.basename(dest)}")
+                    self._update_git_buttons()
                 else:
                     error_msg = result.stderr if result.stderr else result.stdout
                     messagebox.showerror("Error", f"Failed to clone repository:\n{error_msg}", parent=clone_dialog)
@@ -1576,6 +1758,7 @@ class MarkdownEditor:
             if returncode == 0:
                 self.status_bar.config(text="Git repository initialized")
                 messagebox.showinfo("Success", "Git repository initialized successfully", parent=self.root)
+                self._update_git_buttons()
             else:
                 self.status_bar.config(text=f"Git init failed: {stderr}")
                 messagebox.showerror("Error", f"Failed to initialize git:\n{stderr}", parent=self.root)
