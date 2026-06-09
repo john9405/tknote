@@ -1,5 +1,5 @@
 """
-py2app setup script for Markdown Editor
+py2app setup script for tknote
 """
 from setuptools import setup
 
@@ -9,32 +9,34 @@ OPTIONS = {
     'argv_emulation': False,
     'packages': [
         'tkinter',
-        'tkhtmlview',
-        'markdown',
-        'PIL',
-        'requests',
-        'certifi',
-        'charset_normalizer',
-        'idna',
-        'urllib3',
     ],
     'includes': [
         'tkinter',
         'tkinter.ttk',
-        'tkinter.scrolledtext',
         'tkinter.filedialog',
         'tkinter.simpledialog',
         'tkinter.messagebox',
+        'tkinter.font',
+        'builtins',
+        'keyword',
+        'code',
+        'pty',
+        'fcntl',
+        'termios',
+        'select',
+        'signal',
+        'threading',
     ],
     'excludes': [
         'PyQt5', 'PyQt6', 'PySide2', 'PySide6',
         'wx', 'matplotlib', 'numpy', 'scipy',
         'pandas', 'jedi', 'IPython',
+        'tkinter.scrolledtext',
     ],
     'plist': {
-        'CFBundleName': 'Markdown Editor',
-        'CFBundleDisplayName': 'Markdown Editor',
-        'CFBundleIdentifier': 'com.tknote.markdown-editor',
+        'CFBundleName': 'tknote',
+        'CFBundleDisplayName': 'tknote',
+        'CFBundleIdentifier': 'com.tknote.editor',
         'CFBundleVersion': '1.0.0',
         'CFBundleShortVersionString': '1.0.0',
         'NSHighResolutionCapable': True,
@@ -43,7 +45,7 @@ OPTIONS = {
 }
 
 setup(
-    name='Markdown Editor',
+    name='tknote',
     app=APP,
     data_files=DATA_FILES,
     options={'py2app': OPTIONS},

@@ -1,13 +1,900 @@
-import tkinter as tk
-from tkinter import ttk, filedialog, scrolledtext, simpledialog, messagebox
-from tkhtmlview import HTMLLabel
-import markdown
-import tempfile
+import builtins
+import code
+import fcntl
+import keyword
 import os
+import pty
 import re
+import select
+import signal
+import string
+import struct
 import subprocess
-import webbrowser
+import sys
+import termios
+import threading
+import tkinter as tk
+from tkinter import filedialog, font as tkfont, messagebox, simpledialog, ttk
 
+
+# =====================================================================
+# idlelib-style editor infrastructure: Delegator / Percolator chain
+# =====================================================================
+
+class Delegator:
+    """Base class for a delegator in a filter chain."""
+
+    def __init__(self, delegate=None):
+        self.delegate = delegate
+        self.__cache = set()
+
+    def __getattr__(self, name):
+        attr = getattr(self.delegate, name)
+        setattr(self, name, attr)
+        self.__cache.add(name)
+        return attr
+
+    def resetcache(self):
+        for key in self.__cache:
+            try:
+                delattr(self, key)
+            except AttributeError:
+                pass
+        self.__cache.clear()
+
+    def setdelegate(self, delegate):
+        self.resetcache()
+        self.delegate = delegate
+
+
+class WidgetRedirector:
+    """Intercepts Tcl-level widget commands (insert/delete)."""
+
+    def __init__(self, widget):
+        self._operations = {}
+        self.widget = widget
+        self.tk = tk = widget.tk
+        w = widget._w
+        self.orig = w + "_orig"
+        tk.call("rename", w, self.orig)
+        tk.createcommand(w, self.dispatch)
+
+    def close(self):
+        for operation in list(self._operations):
+            self.unregister(operation)
+        widget = self.widget
+        tk = widget.tk
+        w = widget._w
+        tk.deletecommand(w)
+        tk.call("rename", self.orig, w)
+        del self.widget, self.tk
+
+    def register(self, operation, function):
+        self._operations[operation] = function
+        setattr(self.widget, operation, function)
+        return OriginalCommand(self, operation)
+
+    def unregister(self, operation):
+        if operation in self._operations:
+            function = self._operations[operation]
+            del self._operations[operation]
+            try:
+                delattr(self.widget, operation)
+            except AttributeError:
+                pass
+            return function
+        return None
+
+    def dispatch(self, operation, *args):
+        m = self._operations.get(operation)
+        try:
+            if m:
+                return m(*args)
+            else:
+                return self.tk.call((self.orig, operation) + args)
+        except tk.TclError:
+            return ""
+
+
+class OriginalCommand:
+    """Callable that invokes the original (pre-redirect) Tcl command."""
+
+    def __init__(self, redir, operation):
+        self.tk_call = redir.tk.call
+        self.orig_and_operation = (redir.orig, operation)
+
+    def __call__(self, *args):
+        return self.tk_call(self.orig_and_operation + args)
+
+
+class Percolator:
+    """Manages a chain of Delegator filters over a Text widget."""
+
+    def __init__(self, text):
+        self.text = text
+        self.redir = WidgetRedirector(text)
+        self.top = self.bottom = Delegator(text)
+        self.bottom.insert = self.redir.register("insert", self.insert)
+        self.bottom.delete = self.redir.register("delete", self.delete)
+
+    def close(self):
+        while self.top is not self.bottom:
+            self.removefilter(self.top)
+        self.top = None
+        self.bottom.setdelegate(None)
+        self.bottom = None
+        self.redir.close()
+        self.redir = None
+        self.text = None
+
+    def insert(self, index, chars, tags=None):
+        self.top.insert(index, chars, tags)
+
+    def delete(self, index1, index2=None):
+        self.top.delete(index1, index2)
+
+    def insertfilter(self, filter):
+        assert isinstance(filter, Delegator)
+        assert filter.delegate is None
+        filter.setdelegate(self.top)
+        self.top = filter
+
+    def removefilter(self, filter):
+        assert isinstance(filter, Delegator)
+        assert filter.delegate is not None
+        f = self.top
+        if f is filter:
+            self.top = filter.delegate
+            filter.setdelegate(None)
+        else:
+            while f.delegate is not filter:
+                assert f is not self.bottom
+                f.resetcache()
+                f = f.delegate
+            f.setdelegate(filter.delegate)
+            filter.setdelegate(None)
+
+
+# =====================================================================
+# Undo infrastructure (command-pattern)
+# =====================================================================
+
+class InsertCommand:
+    """Undoable insert."""
+
+    def __init__(self, index1, chars, tags=None):
+        self.index1 = index1
+        self.chars = chars
+        self.tags = tags
+        self.index2 = None
+        self.marks_before = {}
+        self.marks_after = {}
+
+    def do(self, text):
+        self.marks_before = self._save_marks(text)
+        self.index1 = text.index(self.index1)
+        if text.compare(self.index1, ">", "end-1c"):
+            self.index1 = text.index("end-1c")
+        text.insert(self.index1, self.chars, self.tags)
+        self.index2 = text.index(f"{self.index1}+{len(self.chars)}c")
+        self.marks_after = self._save_marks(text)
+
+    def redo(self, text):
+        text.mark_set("insert", self.index1)
+        text.insert(self.index1, self.chars, self.tags)
+        self._set_marks(text, self.marks_after)
+        text.see("insert")
+
+    def undo(self, text):
+        text.mark_set("insert", self.index1)
+        text.delete(self.index1, self.index2)
+        self._set_marks(text, self.marks_before)
+        text.see("insert")
+
+    def merge(self, cmd):
+        if self.__class__ is not cmd.__class__:
+            return False
+        if self.index2 != cmd.index1:
+            return False
+        if self.tags != cmd.tags:
+            return False
+        if len(cmd.chars) != 1:
+            return False
+        if self.chars and \
+           self._classify(self.chars[-1]) != self._classify(cmd.chars):
+            return False
+        self.index2 = cmd.index2
+        self.chars = self.chars + cmd.chars
+        return True
+
+    _ALPHANUM = string.ascii_letters + string.digits + "_"
+
+    @classmethod
+    def _classify(cls, c):
+        if c in cls._ALPHANUM:
+            return "alphanumeric"
+        if c == "\n":
+            return "newline"
+        return "punctuation"
+
+    @staticmethod
+    def _save_marks(text):
+        marks = {}
+        for name in text.mark_names():
+            if name not in ("insert", "current"):
+                marks[name] = text.index(name)
+        return marks
+
+    @staticmethod
+    def _set_marks(text, marks):
+        for name, index in marks.items():
+            text.mark_set(name, index)
+
+
+class DeleteCommand:
+    """Undoable delete."""
+
+    def __init__(self, index1, index2=None):
+        self.index1 = index1
+        self.index2 = index2
+        self.chars = None
+        self.marks_before = {}
+        self.marks_after = {}
+
+    def do(self, text):
+        self.marks_before = self._save_marks(text)
+        self.index1 = text.index(self.index1)
+        if self.index2:
+            self.index2 = text.index(self.index2)
+        else:
+            self.index2 = text.index(f"{self.index1}+1c")
+        if text.compare(self.index2, ">", "end-1c"):
+            self.index2 = text.index("end-1c")
+        self.chars = text.get(self.index1, self.index2)
+        text.delete(self.index1, self.index2)
+        self.marks_after = self._save_marks(text)
+
+    def redo(self, text):
+        text.mark_set("insert", self.index1)
+        text.delete(self.index1, self.index2)
+        self._set_marks(text, self.marks_after)
+        text.see("insert")
+
+    def undo(self, text):
+        text.mark_set("insert", self.index1)
+        text.insert(self.index1, self.chars)
+        self._set_marks(text, self.marks_before)
+        text.see("insert")
+
+    @staticmethod
+    def _save_marks(text):
+        marks = {}
+        for name in text.mark_names():
+            if name not in ("insert", "current"):
+                marks[name] = text.index(name)
+        return marks
+
+    @staticmethod
+    def _set_marks(text, marks):
+        for name, index in marks.items():
+            text.mark_set(name, index)
+
+
+class CommandSequence:
+    """Groups multiple commands to be undone/redone as a unit."""
+
+    def __init__(self):
+        self.cmds = []
+        self.depth = 0
+
+    def __len__(self):
+        return len(self.cmds)
+
+    def append(self, cmd):
+        self.cmds.append(cmd)
+
+    def getcmd(self, i):
+        return self.cmds[i]
+
+    def redo(self, text):
+        for cmd in self.cmds:
+            cmd.redo(text)
+
+    def undo(self, text):
+        for cmd in reversed(self.cmds):
+            cmd.undo(text)
+
+    def bump_depth(self, incr=1):
+        self.depth += incr
+        return self.depth
+
+
+class UndoDelegator(Delegator):
+    """Delegator that provides undo/redo by tracking insert/delete commands."""
+
+    max_undo = 1000
+
+    def __init__(self):
+        Delegator.__init__(self)
+        self._modified_callback = None
+        self.reset_undo()
+
+    def setdelegate(self, delegate):
+        if self.delegate is not None:
+            self.unbind("<<undo>>")
+            self.unbind("<<redo>>")
+        Delegator.setdelegate(self, delegate)
+        if delegate is not None:
+            self.bind("<<undo>>", self.undo_event)
+            self.bind("<<redo>>", self.redo_event)
+
+    def reset_undo(self):
+        self.was_saved = -1
+        self.pointer = 0
+        self.undolist = []
+        self.undoblock = 0
+        self.set_saved(1)
+
+    def set_saved(self, flag):
+        self.saved = self.pointer if flag else -1
+        self.can_merge = False
+        self._check_saved()
+
+    def get_saved(self):
+        return self.saved == self.pointer
+
+    def set_modified_callback(self, callback):
+        self._modified_callback = callback
+
+    def _check_saved(self):
+        is_saved = self.get_saved()
+        if is_saved != self.was_saved:
+            self.was_saved = is_saved
+            if self._modified_callback:
+                self._modified_callback(not is_saved)
+
+    def insert(self, index, chars, tags=None):
+        self.addcmd(InsertCommand(index, chars, tags))
+
+    def delete(self, index1, index2=None):
+        self.addcmd(DeleteCommand(index1, index2))
+
+    def undo_block_start(self):
+        if self.undoblock == 0:
+            self.undoblock = CommandSequence()
+        self.undoblock.bump_depth()
+
+    def undo_block_stop(self):
+        if self.undoblock.bump_depth(-1) == 0:
+            cmd = self.undoblock
+            self.undoblock = 0
+            if len(cmd) > 0:
+                if len(cmd) == 1:
+                    cmd = cmd.getcmd(0)
+                self.addcmd(cmd, 0)
+
+    def addcmd(self, cmd, execute=True):
+        if execute:
+            cmd.do(self.delegate)
+        if self.undoblock != 0:
+            self.undoblock.append(cmd)
+            return
+        if self.can_merge and self.pointer > 0:
+            lastcmd = self.undolist[self.pointer - 1]
+            if lastcmd.merge(cmd):
+                return
+        self.undolist[self.pointer:] = [cmd]
+        if self.saved > self.pointer:
+            self.saved = -1
+        self.pointer += 1
+        if len(self.undolist) > self.max_undo:
+            del self.undolist[0]
+            self.pointer -= 1
+            if self.saved >= 0:
+                self.saved -= 1
+        self.can_merge = True
+        self._check_saved()
+
+    def undo_event(self, event=None):
+        if self.pointer == 0:
+            self.bell()
+            return "break"
+        cmd = self.undolist[self.pointer - 1]
+        cmd.undo(self.delegate)
+        self.pointer -= 1
+        self.can_merge = False
+        self._check_saved()
+        return "break"
+
+    def redo_event(self, event=None):
+        if self.pointer >= len(self.undolist):
+            self.bell()
+            return "break"
+        cmd = self.undolist[self.pointer]
+        cmd.redo(self.delegate)
+        self.pointer += 1
+        self.can_merge = False
+        self._check_saved()
+        return "break"
+
+
+# =====================================================================
+# Color / syntax-highlighting delegator
+# =====================================================================
+
+_KEYWORDS = set(keyword.kwlist)
+_BUILTINS = set(
+    name for name in dir(builtins)
+    if not name.startswith('_') and name not in _KEYWORDS
+)
+
+_STRING_PAT = (
+    r'(?:(?:[rR]|[uU]|[fF]|(?:[fF][rR])|(?:[rR][fF]))?'
+    r"""(?:''' (?:[^'\\]|\\.)* (?:'''|$) )|"""
+    r"""(?:' (?:[^'\\\n]|\\.)* (?:'|$) )|"""
+    r"""(?:\"\"\" (?:[^"\\]|\\.)* (?:\"\"\"|$) )|"""
+    r"""(?:" (?:[^"\\\n]|\\.)* (?:"|$) )"""
+    r')'
+)
+_COMMENT_PAT = r'#[^\n]*'
+_DECORATOR_PAT = r'@\w+'
+
+_TOKEN_RE = re.compile(
+    '|'.join([
+        f'(?P<STRING>{_STRING_PAT})',
+        f'(?P<COMMENT>{_COMMENT_PAT})',
+        f'(?P<DECORATOR>{_DECORATOR_PAT})',
+        r'(?P<KEYWORD>\b' + '|'.join(_KEYWORDS) + r'\b)',
+        r'(?P<BUILTIN>(?<![.\'\"\\#])\b' + '|'.join(_BUILTINS) + r'\b)',
+        r'(?P<NUMBER>\b\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b)',
+        r'(?P<DEF>\bdef\s+(\w+)\b)',
+        r'(?P<CLASS>\bclass\s+(\w+)\b)',
+    ]),
+    re.MULTILINE
+)
+
+_TAG_STYLES = {
+    'KEYWORD':   {'foreground': '#ff7b00'},
+    'BUILTIN':   {'foreground': '#795e26'},
+    'STRING':    {'foreground': '#098658'},
+    'COMMENT':   {'foreground': '#6a9955'},
+    'DECORATOR': {'foreground': '#b08000'},
+    'NUMBER':    {'foreground': '#098658'},
+    'DEF':       {'foreground': '#795e26'},
+    'CLASS':     {'foreground': '#795e26'},
+}
+
+
+class ColorDelegator(Delegator):
+    """Re-tags text with syntax colors after each modification.
+
+    Optimizations for large files:
+      - Only recolor the visible region + a generous buffer (not the whole doc).
+      - Skip scheduling a new recolor if one is already pending.
+      - Scroll-triggered recoloring of newly visible lines.
+    """
+
+    COLOR_BUF_LINES = 150  # lines above/below visible region to also color
+
+    def __init__(self):
+        Delegator.__init__(self)
+        self.prog = _TOKEN_RE
+        self._recolor_pending = False
+        self._colored_range = (0, 0)  # (first_line, last_line) already colored
+
+    def setdelegate(self, delegate):
+        if self.delegate is not None:
+            self.unbind("<<toggle-auto-coloring>>")
+        Delegator.setdelegate(self, delegate)
+        if delegate is not None:
+            self.bind("<<toggle-auto-coloring>>", self.toggle_colorize_event)
+        self._setup_tags()
+
+    def _setup_tags(self):
+        text = self.delegate
+        if text is None:
+            return
+        for tag_name, style in _TAG_STYLES.items():
+            text.tag_configure(tag_name, **style)
+
+    def insert(self, index, chars, tags=None):
+        self.delegate.insert(index, chars, tags)
+        self._recolor_after(index, chars)
+
+    def delete(self, index1, index2=None):
+        self.delegate.delete(index1, index2)
+        self._recolor_after(index1, "")
+
+    def _recolor_after(self, index, chars):
+        if not self._recolor_pending:
+            self._recolor_pending = True
+            try:
+                self.delegate.after_idle(self._do_recolor)
+            except (tk.TclError, AttributeError):
+                self._recolor_pending = False
+
+    def recolor_full(self):
+        """Force a full-document recolor (used after bulk load)."""
+        self._colored_range = (0, 0)
+        self._recolor_pending = False
+        self._do_recolor_full()
+
+    def _do_recolor_full(self):
+        """Recolor the entire document (expensive, use sparingly)."""
+        text = self.delegate
+        if text is None:
+            return
+        try:
+            for tag_name in _TAG_STYLES:
+                text.tag_remove(tag_name, "1.0", "end")
+            content = text.get("1.0", "end-1c")
+            if not content:
+                return
+            for m in self.prog.finditer(content):
+                start = f"1.0+{m.start()}c"
+                end = f"1.0+{m.end()}c"
+                for group_name in _TAG_STYLES:
+                    if m.group(group_name) is not None:
+                        text.tag_add(group_name, start, end)
+                        break
+            last_line = int(text.index('end-1c').split('.')[0])
+            self._colored_range = (1, last_line)
+        except tk.TclError:
+            pass
+
+    def _do_recolor(self):
+        """Recolor only the visible region + buffer."""
+        self._recolor_pending = False
+        text = self.delegate
+        if text is None:
+            return
+        try:
+            vis_first, vis_last = self._visible_line_range(text)
+            if vis_first is None:
+                return
+
+            buf = self.COLOR_BUF_LINES
+            first = max(1, vis_first - buf)
+            last_line = int(text.index('end-1c').split('.')[0])
+            last = min(last_line, vis_last + buf)
+
+            # Skip if already covered
+            old_first, old_last = self._colored_range
+            if first >= old_first and last <= old_last:
+                return
+
+            # Expand range to cover the gap
+            first = min(first, old_first) if old_first else first
+            last = max(last, old_last) if old_last else last
+
+            # Remove old tags in range and re-tag
+            for tag_name in _TAG_STYLES:
+                text.tag_remove(tag_name, f'{first}.0', f'{last}.0 lineend')
+
+            content = text.get(f'{first}.0', f'{last}.0 lineend')
+            if not content:
+                return
+
+            offset = f'{first}.0'
+            for m in self.prog.finditer(content):
+                start = text.index(f"{offset}+{m.start()}c")
+                end = text.index(f"{offset}+{m.end()}c")
+                for group_name in _TAG_STYLES:
+                    if m.group(group_name) is not None:
+                        text.tag_add(group_name, start, end)
+                        break
+
+            self._colored_range = (first, last)
+        except tk.TclError:
+            pass
+
+    def _visible_line_range(self, text):
+        """Return (first_visible_line, last_visible_line) or (None, None)."""
+        try:
+            top = text.index('@0,0')
+            bot = text.index(f'@0,{text.winfo_height()}')
+            return int(top.split('.')[0]), int(bot.split('.')[0])
+        except tk.TclError:
+            return None, None
+
+    def toggle_colorize_event(self, event=None):
+        return "break"
+
+
+# =====================================================================
+# EditorWidget — self-contained editor with line numbers & highlighting
+# =====================================================================
+
+class EditorWidget(tk.Frame):
+    """Self-contained code editor with line numbers, undo, and highlighting."""
+
+    LINE_NUM_WIDTH = 40
+    LINE_NUM_BG = '#f0f0f0'
+    LINE_NUM_FG = '#999999'
+    EDITOR_FONT = ('Monaco', 12)
+    EDITOR_BG = '#ffffff'
+    EDITOR_FG = '#1e1e1e'
+    INSERT_BG = '#1e1e1e'
+
+    def __init__(self, parent, **kwargs):
+        super().__init__(parent, **kwargs)
+        self._modified = False
+        self._line_numbers_visible = True
+        self._build_ui()
+
+    # ---- UI construction ---------------------------------------------------
+
+    def _build_ui(self):
+        # Line numbers (Canvas)
+        self._line_canvas = tk.Canvas(
+            self, width=self.LINE_NUM_WIDTH, bg=self.LINE_NUM_BG,
+            highlightthickness=0, bd=0)
+        self._line_canvas.pack(side=tk.LEFT, fill=tk.Y)
+
+        # Text + scrollbar
+        text_frame = tk.Frame(self)
+        text_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self._text = tk.Text(
+            text_frame,
+            wrap=tk.NONE,
+            font=self.EDITOR_FONT,
+            bg=self.EDITOR_BG,
+            fg=self.EDITOR_FG,
+            insertbackground=self.INSERT_BG,
+            highlightthickness=0,
+            bd=0,
+            padx=8,
+            pady=4,
+            tabstyle='wordprocessor',
+            undo=False,
+            autoseparators=False,
+        )
+        self._text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self._scrollbar = tk.Scrollbar(
+            text_frame, orient=tk.VERTICAL, command=self._text.yview)
+        self._scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self._text.configure(yscrollcommand=self._on_scroll)
+
+        # Percolator chain: Undo → Color
+        self._percolator = Percolator(self._text)
+        self._undo = UndoDelegator()
+        self._percolator.insertfilter(self._undo)
+        self._undo.set_modified_callback(self._on_modified_changed)
+
+        self._color = ColorDelegator()
+        self._percolator.insertfilter(self._color)
+
+        # Track content changes for line numbers
+        self._text.bind('<KeyRelease>', self._on_content_change)
+        self._text.bind('<<Modified>>', self._noop)
+        self._text.bind('<Configure>', self._on_text_configure)
+        # Scroll-triggered recoloring for newly visible regions
+        self._text.bind('<<Scroll>>', self._on_scroll_recolor)
+
+        self.after_idle(self._draw_line_numbers)
+
+    # ---- Scroll sync -------------------------------------------------------
+
+    def _on_scroll(self, *args):
+        self._scrollbar.set(*args)
+        self._text.yview_moveto(args[0])
+        self._draw_line_numbers()
+
+    def _on_scroll_recolor(self, event=None):
+        """Recolor newly visible lines after scrolling."""
+        self._color._colored_range = (0, 0)  # force recolor of visible region
+        self._color._recolor_after("1.0", "")
+
+    def yview(self, *args):
+        self._text.yview(*args)
+        self._draw_line_numbers()
+
+    def _on_text_configure(self, event=None):
+        self._draw_line_numbers()
+
+    def _on_content_change(self, event=None):
+        self.after_idle(self._draw_line_numbers)
+
+    def _noop(self, event=None):
+        pass
+
+    # ---- Line numbers ------------------------------------------------------
+
+    def _draw_line_numbers(self):
+        canvas = self._line_canvas
+        text = self._text
+        try:
+            canvas.delete('all')
+            if not self._line_numbers_visible:
+                return
+            top_idx = text.index('@0,0')
+            bot_idx = text.index(f'@0,{text.winfo_height()}')
+            top_line = int(top_idx.split('.')[0])
+            bot_line = int(bot_idx.split('.')[0])
+            last_char_y = text.bbox(f'{bot_line}.0')
+            if last_char_y is None:
+                last_char_y = (text.winfo_height(), 0)
+            if last_char_y[1] <= 0:
+                bot_line -= 1
+            canvas_w = self.LINE_NUM_WIDTH
+            for line in range(top_line, bot_line + 1):
+                try:
+                    dline = text.dlineinfo(f'{line}.0')
+                    if dline is None:
+                        continue
+                    y = dline[1]
+                    canvas.create_text(
+                        canvas_w - 8, y,
+                        text=str(line),
+                        anchor='ne',
+                        font=self.EDITOR_FONT,
+                        fill=self.LINE_NUM_FG,
+                    )
+                except tk.TclError:
+                    pass
+            canvas.configure(height=text.winfo_height())
+        except tk.TclError:
+            pass
+
+    # ---- Public API --------------------------------------------------------
+
+    def get_text(self):
+        return self._text.get('1.0', 'end-1c')
+
+    def set_text(self, content):
+        """Replace all text.  Bypasses the colorizer during bulk load for speed."""
+        # Temporarily remove colorizer — large files would otherwise trigger
+        # repeated regex scans during the bulk insert.
+        self._percolator.removefilter(self._color)
+        self._undo.undo_block_start()
+        try:
+            self._text.delete('1.0', 'end')
+            if content:
+                self._text.insert('1.0', content)
+        finally:
+            self._undo.undo_block_stop()
+        self._undo.reset_undo()
+        self._undo.set_saved(1)
+        # Re-add colorizer; schedule visible-region recolor
+        self._percolator.insertfilter(self._color)
+        self._color._colored_range = (0, 0)
+        self._color._recolor_after("1.0", "")  # schedule visible-region recolor
+        self._draw_line_numbers()
+
+    def get_text_widget(self):
+        return self._text
+
+    def undo(self):
+        self._undo.undo_event()
+
+    def redo(self):
+        self._undo.redo_event()
+
+    def cut(self):
+        try:
+            self._text.event_generate('<<Cut>>')
+        except tk.TclError:
+            pass
+
+    def copy(self):
+        try:
+            self._text.event_generate('<<Copy>>')
+        except tk.TclError:
+            pass
+
+    def paste(self):
+        try:
+            self._text.event_generate('<<Paste>>')
+        except tk.TclError:
+            pass
+
+    def select_all(self):
+        self._text.tag_add(tk.SEL, '1.0', 'end')
+        self._text.mark_set(tk.INSERT, '1.0')
+        self._text.see(tk.INSERT)
+        return 'break'
+
+    def is_modified(self):
+        return self._modified
+
+    def set_saved(self):
+        self._undo.set_saved(1)
+
+    # ---- Text widget delegation --------------------------------------------
+
+    def get(self, *args):
+        return self._text.get(*args)
+
+    def insert(self, index, text, tags=None):
+        self._text.insert(index, text, tags)
+
+    def delete(self, index1, index2=None):
+        self._text.delete(index1, index2)
+
+    def index(self, index):
+        return self._text.index(index)
+
+    def tag_add(self, tag, index1, index2=None):
+        self._text.tag_add(tag, index1, index2)
+
+    def tag_remove(self, tag, index1, index2=None):
+        self._text.tag_remove(tag, index1, index2)
+
+    def tag_config(self, tag, **kw):
+        self._text.tag_config(tag, **kw)
+
+    def tag_delete(self, tag):
+        self._text.tag_delete(tag)
+
+    def mark_set(self, mark, index):
+        self._text.mark_set(mark, index)
+
+    def see(self, index):
+        self._text.see(index)
+
+    def search(self, pattern, index, **kw):
+        return self._text.search(pattern, index, **kw)
+
+    def dlineinfo(self, index):
+        return self._text.dlineinfo(index)
+
+    def compare(self, index1, op, index2):
+        return self._text.compare(index1, op, index2)
+
+    def edit_reset(self):
+        self._undo.reset_undo()
+        self._undo.set_saved(1)
+
+    def edit_modified(self, flag=None):
+        return False
+
+    def edit_undo(self):
+        self.undo()
+
+    def edit_redo(self):
+        self.redo()
+
+    def edit_separator(self):
+        pass
+
+    def focus_set(self):
+        self._text.focus_set()
+
+    def get_line_numbers_visible(self):
+        return self._line_numbers_visible
+
+    def toggle_line_numbers(self):
+        self._line_numbers_visible = not self._line_numbers_visible
+        if self._line_numbers_visible:
+            self._line_canvas.pack(side=tk.LEFT, fill=tk.Y)
+            self._line_canvas.configure(width=self.LINE_NUM_WIDTH)
+        else:
+            self._line_canvas.pack_forget()
+        self._draw_line_numbers()
+        return self._line_numbers_visible
+
+    def _on_modified_changed(self, modified):
+        self._modified = modified
+
+    def bind(self, sequence=None, func=None, add=None):
+        return self._text.bind(sequence, func, add)
+
+    def event_generate(self, sequence, **kw):
+        self._text.event_generate(sequence, **kw)
+
+    def destroy(self):
+        try:
+            self._percolator.close()
+        except Exception:
+            pass
+        super().destroy()
+
+
+# =====================================================================
+# TabbedEditor
+# =====================================================================
 
 class TabbedEditor(ttk.Frame):
     """Multi-tab editor using Canvas for tab headers + Frame per tab content."""
@@ -33,7 +920,6 @@ class TabbedEditor(ttk.Frame):
         # Hit-testing state (rebuilt on each _redraw)
         self._tab_rects = []     # [(x1, y1, x2, y2, tab_index), ...]
         self._close_rects = []   # [(x1, y1, x2, y2, tab_index), ...]
-        self._plus_rect = None   # (x1, y1, x2, y2)
 
         self._build_ui()
 
@@ -52,16 +938,6 @@ class TabbedEditor(ttk.Frame):
         self.tab_canvas.bind('<Button-1>', self._on_canvas_click)
         self.tab_canvas.bind('<MouseWheel>', self._on_mousewheel)
 
-        # Plus button
-        self._plus_canvas = tk.Canvas(
-            tab_bar_frame, width=26, height=self.TAB_HEIGHT + 3,
-            bg='#ececec', highlightthickness=0
-        )
-        self._plus_canvas.pack(side=tk.RIGHT)
-        self._plus_canvas.bind('<Button-1>',
-            lambda e: self._on_new_tab_request and self._on_new_tab_request())
-        self._draw_plus_button()
-
         # Horizontal scrollbar (hidden until needed)
         self.tab_scrollbar = ttk.Scrollbar(
             tab_bar_frame, orient=tk.HORIZONTAL,
@@ -76,86 +952,30 @@ class TabbedEditor(ttk.Frame):
         # Separator line below tabs
         ttk.Separator(self, orient=tk.HORIZONTAL).pack(fill=tk.X, side=tk.TOP)
 
-    def _draw_plus_button(self):
-        self._plus_canvas.delete('all')
-        w, h = 26, self.TAB_HEIGHT + 3
-        self._plus_canvas.create_text(
-            w // 2, h // 2 - 1, text='+',
-            font=('Helvetica', 13, 'bold'),
-            fill='#555555', anchor='center'
-        )
-
     # ---- Public API --------------------------------------------------------
 
-    def add_tab(self, title='Untitled', file_path=None, content='', file_type='md'):
-        """Add a new tab and return its tab_id.
-
-        file_type: 'md' for markdown (shows preview), 'txt' for plain text (editor only).
-        """
+    def add_tab(self, title='Untitled', file_path=None, content=''):
+        """Add a new tab and return its tab_id."""
         tab_id = self._tab_id_counter
         self._tab_id_counter += 1
 
         # Main tab frame
         tab_frame = ttk.Frame(self.content_frame)
 
-        # Toolbar above the editor/preview split
-        tab_toolbar = ttk.Frame(tab_frame)
-        tab_toolbar.pack(fill=tk.X, side=tk.TOP)
-
-        preview_btn = ttk.Button(
-            tab_toolbar, text='👁', width=3,
-            command=lambda tid=tab_id: self.toggle_tab_preview(tid)
-        )
-        preview_btn.pack(side=tk.RIGHT, padx=(0, 2))
-
-        # PanedWindow for editor (left) + preview (right)
-        tab_paned = ttk.PanedWindow(tab_frame, orient=tk.HORIZONTAL)
-        tab_paned.pack(fill=tk.BOTH, expand=True)
-
-        # -- Editor pane --
-        editor_frame = ttk.Frame(tab_paned)
-        editor = scrolledtext.ScrolledText(
-            editor_frame, wrap=tk.WORD,
-            font=('Monaco', 12), tabstyle='wordprocessor',
-            insertbackground='black',
-            undo=True, autoseparators=True, maxundo=-1
-        )
+        # Editor widget (idlelib-style: line numbers + text + syntax highlighting)
+        editor = EditorWidget(tab_frame)
         editor.pack(fill=tk.BOTH, expand=True)
-        tab_paned.add(editor_frame, weight=1)
-
-        # -- Preview pane --
-        preview_frame = ttk.Frame(tab_paned)
-        preview = HTMLLabel(preview_frame)
-        preview.pack(fill=tk.BOTH, expand=True)
-        preview.set_html('')
-        tab_paned.add(preview_frame, weight=1)
 
         if content:
-            editor.insert(tk.END, content)
-            editor.edit_modified(False)  # reset after initial load
-
-        # For plain text files: hide the preview button and pane
-        if file_type == 'txt':
-            preview_btn.pack_forget()
-            tab_paned.forget(preview_frame)
-
-        # Track modified state via <<Modified>> virtual event
-        editor.bind('<<Modified>>',
-            lambda e, tid=tab_id: self._on_editor_modified(tid, e))
+            editor.set_text(content)
+            editor.set_saved()
 
         tab = {
             'id': tab_id,
             'title': title,
             'file_path': file_path,
-            'file_type': file_type,
             'editor': editor,
             'frame': tab_frame,
-            'preview': preview,
-            'preview_frame': preview_frame,
-            'preview_btn': preview_btn,
-            'tab_paned': tab_paned,
-            'preview_visible': file_type != 'txt',
-            'modified': False,
         }
         self._tabs.append(tab)
 
@@ -236,7 +1056,7 @@ class TabbedEditor(ttk.Frame):
         return -1
 
     def get_active_editor(self):
-        """Return the ScrolledText widget of the active tab, or None."""
+        """Return the EditorWidget of the active tab, or None."""
         if 0 <= self._active_index < len(self._tabs):
             return self._tabs[self._active_index]['editor']
         return None
@@ -269,12 +1089,9 @@ class TabbedEditor(ttk.Frame):
             tab['title'] = title
             self._redraw()
 
-    def set_tab_modified(self, tab_id, modified):
-        """Set or clear the modified flag for a tab."""
-        tab = self.get_tab_by_id(tab_id)
-        if tab and tab['modified'] != modified:
-            tab['modified'] = modified
-            self._redraw()
+    def set_tab_modified(self, tab_id=None, modified=None):
+        """No-op — EditorWidget tracks its own modified state internally."""
+        self._redraw()
 
     def get_tab_count(self):
         """Return the number of open tabs."""
@@ -284,77 +1101,13 @@ class TabbedEditor(ttk.Frame):
         """Return the index of the currently active tab."""
         return self._active_index
 
-    def toggle_tab_preview(self, tab_id):
-        """Toggle the preview pane for a specific tab. Returns new state."""
-        tab = self.get_tab_by_id(tab_id)
-        if not tab:
-            return True
-        # Plain text tabs have no preview
-        if tab.get('file_type') == 'txt':
-            return False
-        visible = not tab.get('preview_visible', True)
-        tab['preview_visible'] = visible
-        if visible:
-            tab['tab_paned'].add(tab['preview_frame'], weight=1)
-        else:
-            tab['tab_paned'].forget(tab['preview_frame'])
-        return visible
-
-    def toggle_preview(self):
-        """Toggle the preview pane for the active tab. Returns new state."""
-        tab = self.get_active_tab()
-        if not tab:
-            return True
-        return self.toggle_tab_preview(tab['id'])
-
-    def update_active_preview(self, html_content):
-        """Update the preview content for the active tab (no-op for txt files)."""
-        tab = self.get_active_tab()
-        if tab and tab.get('file_type') != 'txt':
-            tab['preview'].set_html(html_content)
-
-    def get_preview_visible(self):
-        """Return whether the active tab's preview is visible."""
-        tab = self.get_active_tab()
-        if tab:
-            return tab.get('preview_visible', True)
-        return True
-
-    def set_tab_file_type(self, tab_id, file_type):
-        """Update a tab's file type, showing/hiding preview accordingly."""
-        tab = self.get_tab_by_id(tab_id)
-        if not tab:
-            return
-        old_type = tab.get('file_type', 'md')
-        if old_type == file_type:
-            return
-        tab['file_type'] = file_type
-        if file_type == 'txt':
-            # Hide preview
-            tab['preview_btn'].pack_forget()
-            tab['tab_paned'].forget(tab['preview_frame'])
-            tab['preview_visible'] = False
-        else:
-            # Show preview
-            tab['preview_btn'].pack(side=tk.RIGHT, padx=(0, 2))
-            tab['tab_paned'].add(tab['preview_frame'], weight=1)
-            tab['preview_visible'] = True
-
     # ---- Internal helpers --------------------------------------------------
-
-    def _on_editor_modified(self, tab_id, event):
-        """Fired when a tab's editor content changes."""
-        editor = event.widget
-        if editor.edit_modified():
-            self.set_tab_modified(tab_id, True)
-            editor.edit_modified(False)  # reset so it fires again
 
     def _redraw(self):
         """Redraw all tab headers on the canvas."""
         self.tab_canvas.delete('all')
         self._tab_rects = []
         self._close_rects = []
-        self._plus_rect = None
 
         # Use a reasonable default width if canvas not yet realized
         canvas_w = self.tab_canvas.winfo_width()
@@ -365,7 +1118,8 @@ class TabbedEditor(ttk.Frame):
 
         for i, tab in enumerate(self._tabs):
             # Build display text
-            display = '• ' + tab['title'] if tab['modified'] else tab['title']
+            modified = tab['editor'].is_modified()
+            display = '• ' + tab['title'] if modified else tab['title']
 
             # Estimate text width (approx pixels at 11pt Helvetica)
             text_px = len(display) * 8
@@ -416,11 +1170,8 @@ class TabbedEditor(ttk.Frame):
 
             x += tab_w + 2
 
-        # Store plus button rect (for completeness)
-        self._plus_rect = (x, y, x + 26, y + h)
-
         # Update scroll region
-        total_w = x + 30
+        total_w = x + 4
         self.tab_canvas.configure(scrollregion=(0, 0, total_w, h + 4))
 
         # Show/hide scrollbar
@@ -454,6 +1205,374 @@ class TabbedEditor(ttk.Frame):
         self.tab_canvas.xview_scroll(int(-event.delta / 30), 'units')
 
 
+class _WidgetWriter:
+    """Redirects writes to a tkinter Text widget (thread-safe via after)."""
+
+    def __init__(self, widget, panel):
+        self.widget = widget
+        self.panel = panel
+
+    def write(self, s):
+        if s:
+            self.panel.after(0, lambda s=s: self._write(s))
+
+    def _write(self, s):
+        try:
+            self.widget.configure(state=tk.NORMAL)
+            self.widget.insert(tk.END, s)
+            self.widget.see(tk.END)
+            self.widget.configure(state=tk.DISABLED)
+        except tk.TclError:
+            pass  # widget destroyed
+
+    def flush(self):
+        pass
+
+
+class TerminalPanel(ttk.Frame):
+    """Bottom panel with Python IDLE Shell and system Terminal tabs."""
+
+    def __init__(self, parent, **kwargs):
+        super().__init__(parent, **kwargs)
+        self._python_console = None
+        self._python_locals = {}
+        self._python_history = []
+        self._python_history_pos = 0
+        self._python_multiline = []
+        self._shell_proc = None
+        self._shell_master_fd = None
+        self._reader_thread = None
+        self._reader_stop = threading.Event()
+        self._active_tab = 'python'
+        self._close_callback = None
+        self._build_ui()
+        self._start_python_shell()
+        self._start_shell()
+
+    # ---- UI construction ---------------------------------------------------
+
+    def _build_ui(self):
+        self.configure(height=200)
+
+        # Tab bar
+        self._tab_bar = ttk.Frame(self)
+        self._tab_bar.pack(fill=tk.X, side=tk.TOP)
+
+        self._python_btn = ttk.Button(
+            self._tab_bar, text='Python', width=10,
+            command=lambda: self._switch_tab('python'))
+        self._python_btn.pack(side=tk.LEFT, padx=(4, 1), pady=(2, 0))
+
+        self._shell_btn = ttk.Button(
+            self._tab_bar, text='Terminal', width=10,
+            command=lambda: self._switch_tab('shell'))
+        self._shell_btn.pack(side=tk.LEFT, padx=1, pady=(2, 0))
+
+        # Close button
+        close_btn = ttk.Button(
+            self._tab_bar, text='×', width=2,
+            command=self._on_close)
+        close_btn.pack(side=tk.RIGHT, padx=(0, 4), pady=(2, 0))
+
+        ttk.Separator(self, orient=tk.HORIZONTAL).pack(fill=tk.X, side=tk.TOP)
+
+        # Content area (stacks tab frames)
+        self._content = ttk.Frame(self)
+        self._content.pack(fill=tk.BOTH, expand=True, side=tk.TOP)
+
+        # ---- Python tab ----
+        self._python_frame = ttk.Frame(self._content)
+        self._python_frame.grid_rowconfigure(0, weight=1)
+        self._python_frame.grid_columnconfigure(1, weight=1)
+
+        self._python_output = tk.Text(
+            self._python_frame, state=tk.DISABLED,
+            bg='#1e1e1e', fg='#d4d4d4', insertbackground='white',
+            font=('Monaco', 11), wrap=tk.WORD)
+        py_scroll = ttk.Scrollbar(self._python_frame,
+                                  command=self._python_output.yview)
+        self._python_output.configure(yscrollcommand=py_scroll.set)
+        self._python_output.grid(row=0, column=0, columnspan=2, sticky='nsew')
+        py_scroll.grid(row=0, column=2, sticky='ns')
+        self._python_output.bind('<Key>', lambda e: 'break')  # block typing in output
+
+        # Input row
+        ttk.Label(self._python_frame, text='>>>',
+                  font=('Monaco', 11, 'bold'),
+                  foreground='#569cd6').grid(
+            row=1, column=0, sticky='w', padx=(4, 2), pady=(2, 4))
+        self._python_input = ttk.Entry(self._python_frame, font=('Monaco', 11))
+        self._python_input.grid(row=1, column=1, sticky='ew', padx=(0, 4), pady=(2, 4))
+        self._python_input.bind('<Return>', lambda e: self._send_python_input())
+        self._python_input.bind('<Up>', self._python_history_up)
+        self._python_input.bind('<Down>', self._python_history_down)
+
+        # ---- Shell tab ----
+        self._shell_frame = ttk.Frame(self._content)
+        self._shell_frame.grid_rowconfigure(0, weight=1)
+        self._shell_frame.grid_columnconfigure(1, weight=1)
+
+        self._shell_output = tk.Text(
+            self._shell_frame, state=tk.DISABLED,
+            bg='#1e1e1e', fg='#d4d4d4', insertbackground='white',
+            font=('Monaco', 11), wrap=tk.WORD)
+        sh_scroll = ttk.Scrollbar(self._shell_frame,
+                                  command=self._shell_output.yview)
+        self._shell_output.configure(yscrollcommand=sh_scroll.set)
+        self._shell_output.grid(row=0, column=0, columnspan=2, sticky='nsew')
+        sh_scroll.grid(row=0, column=2, sticky='ns')
+        self._shell_output.bind('<Key>', lambda e: 'break')
+
+        ttk.Label(self._shell_frame, text='$',
+                  font=('Monaco', 11, 'bold'),
+                  foreground='#569cd6').grid(
+            row=1, column=0, sticky='w', padx=(4, 2), pady=(2, 4))
+        self._shell_input = ttk.Entry(self._shell_frame, font=('Monaco', 11))
+        self._shell_input.grid(row=1, column=1, sticky='ew', padx=(0, 4), pady=(2, 4))
+        self._shell_input.bind('<Return>', lambda e: self._send_shell_input())
+
+        # Show Python tab by default
+        self._switch_tab('python')
+
+    # ---- Tab switching -----------------------------------------------------
+
+    def set_close_callback(self, callback):
+        """Called when the close (×) button is clicked."""
+        self._close_callback = callback
+
+    def _on_close(self):
+        if self._close_callback:
+            self._close_callback()
+
+    def _switch_tab(self, tab):
+        self._active_tab = tab
+        if tab == 'python':
+            self._shell_frame.pack_forget()
+            self._python_frame.pack(fill=tk.BOTH, expand=True)
+            self._python_input.focus_set()
+        else:
+            self._python_frame.pack_forget()
+            self._shell_frame.pack(fill=tk.BOTH, expand=True)
+            self._shell_input.focus_set()
+
+    # ---- Python IDLE Shell ------------------------------------------------
+
+    def _start_python_shell(self):
+        self._python_console = code.InteractiveConsole(locals=self._python_locals)
+        version = sys.version.split()[0]
+        self._append_python_output(
+            f'Python {version} Interactive Shell\n'
+            f'Type "help", "copyright", "credits" or "license" for more.\n'
+            f'>>> ')
+
+    def _append_python_output(self, text):
+        try:
+            self._python_output.configure(state=tk.NORMAL)
+            self._python_output.insert(tk.END, text)
+            self._python_output.see(tk.END)
+            self._python_output.configure(state=tk.DISABLED)
+        except tk.TclError:
+            pass
+
+    def _send_python_input(self):
+        code_text = self._python_input.get()
+        self._python_input.delete(0, tk.END)
+
+        if self._python_multiline:
+            # Continuing a multi-line block
+            self._python_history.append(code_text)
+            self._python_history_pos = len(self._python_history)
+
+            if code_text.strip() == '':
+                # Empty line → execute the block
+                block = '\n'.join(self._python_multiline)
+                self._python_multiline = []
+                self._append_python_output('\n')
+                self._execute_python(block)
+                self._append_python_output('>>> ')
+            else:
+                self._python_multiline.append(code_text)
+                self._append_python_output(f'... {code_text}\n')
+            return
+
+        if not code_text.strip():
+            self._append_python_output('>>> ')
+            return
+
+        self._python_history.append(code_text)
+        self._python_history_pos = len(self._python_history)
+        self._append_python_output(code_text + '\n')
+
+        # Test if this input starts a multi-line block
+        try:
+            compiled = code.compile_command(code_text, '<stdin>', 'single')
+        except (SyntaxError, OverflowError, ValueError):
+            # Show the error and continue
+            self._execute_python(code_text)
+            self._append_python_output('>>> ')
+            return
+
+        if compiled is None:
+            # Incomplete — start multi-line collection
+            self._python_multiline = [code_text]
+            self._append_python_output('... ')
+        else:
+            self._execute_python(code_text)
+            self._append_python_output('>>> ')
+
+    def _execute_python(self, code_text):
+        old_stdout = sys.stdout
+        old_stderr = sys.stderr
+        sys.stdout = _WidgetWriter(self._python_output, self)
+        sys.stderr = _WidgetWriter(self._python_output, self)
+        try:
+            self._python_console.push(code_text)
+        finally:
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
+
+    def _python_history_up(self, event):
+        if self._python_history and not self._python_multiline:
+            self._python_history_pos = max(0, self._python_history_pos - 1)
+            self._python_input.delete(0, tk.END)
+            self._python_input.insert(
+                0, self._python_history[self._python_history_pos])
+
+    def _python_history_down(self, event):
+        if self._python_history and not self._python_multiline:
+            self._python_history_pos = min(
+                len(self._python_history), self._python_history_pos + 1)
+            self._python_input.delete(0, tk.END)
+            if self._python_history_pos < len(self._python_history):
+                self._python_input.insert(
+                    0, self._python_history[self._python_history_pos])
+
+    # ---- System Shell / Terminal ------------------------------------------
+
+    def _start_shell(self):
+        shell = os.environ.get('SHELL', '/bin/zsh')
+        try:
+            master_fd, slave_fd = pty.openpty()
+        except OSError:
+            self._append_shell_output('[Error: could not open PTY]\n')
+            return
+
+        # Set terminal size
+        try:
+            winsize = struct.pack('HHHH', 24, 80, 0, 0)
+            fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsize)
+        except Exception:
+            pass
+
+        try:
+            self._shell_proc = subprocess.Popen(
+                [shell, '-i'],
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                preexec_fn=os.setsid,
+                env={**os.environ, 'TERM': 'xterm-256color'},
+                close_fds=True,
+            )
+        except Exception as e:
+            self._append_shell_output(f'[Error: {e}]\n')
+            os.close(master_fd)
+            os.close(slave_fd)
+            return
+
+        os.close(slave_fd)
+        self._shell_master_fd = master_fd
+
+        # Non-blocking reads
+        flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
+        fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+        self._reader_stop.clear()
+        self._reader_thread = threading.Thread(
+            target=self._read_pty_output, daemon=True)
+        self._reader_thread.start()
+
+    def _append_shell_output(self, text):
+        try:
+            self._shell_output.configure(state=tk.NORMAL)
+            self._shell_output.insert(tk.END, text)
+            self._shell_output.see(tk.END)
+            self._shell_output.configure(state=tk.DISABLED)
+        except tk.TclError:
+            pass
+
+    def _read_pty_output(self):
+        fd = self._shell_master_fd
+        while not self._reader_stop.is_set() and fd is not None:
+            try:
+                r, _, _ = select.select([fd], [], [], 0.1)
+                if r:
+                    data = os.read(fd, 4096)
+                    if not data:
+                        break
+                    decoded = data.decode('utf-8', errors='replace')
+                    self.after(0, lambda d=decoded: self._append_shell_output(d))
+            except OSError:
+                break
+        # Subprocess exited
+        if not self._reader_stop.is_set():
+            self.after(0, self._handle_shell_exit)
+
+    def _send_shell_input(self):
+        text = self._shell_input.get()
+        self._shell_input.delete(0, tk.END)
+        fd = self._shell_master_fd
+        if fd is not None and text:
+            try:
+                os.write(fd, (text + '\n').encode('utf-8'))
+            except OSError:
+                self._append_shell_output('[Error: cannot send input]\n')
+
+    def _handle_shell_exit(self):
+        self._append_shell_output('\n[Process exited — restarting...]\n')
+        if self._shell_master_fd is not None:
+            try:
+                os.close(self._shell_master_fd)
+            except OSError:
+                pass
+            self._shell_master_fd = None
+        self._shell_proc = None
+        # Auto-restart after a brief delay
+        self.after(500, self._start_shell)
+
+    # ---- Lifecycle ---------------------------------------------------------
+
+    def focus_input(self):
+        """Focus the input field of the active tab."""
+        if self._active_tab == 'python':
+            self._python_input.focus_set()
+        else:
+            self._shell_input.focus_set()
+
+    def cleanup(self):
+        """Kill subprocess and stop reader thread."""
+        self._reader_stop.set()
+        # Wake up select() by closing the fd
+        fd = self._shell_master_fd
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            self._shell_master_fd = None
+        if self._reader_thread and self._reader_thread.is_alive():
+            self._reader_thread.join(timeout=2.0)
+        if self._shell_proc and self._shell_proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(self._shell_proc.pid), signal.SIGTERM)
+                self._shell_proc.wait(timeout=2)
+            except Exception:
+                try:
+                    self._shell_proc.kill()
+                except Exception:
+                    pass
+
+
 class MarkdownEditor:
     def __init__(self, root):
         self.root = root
@@ -462,6 +1581,7 @@ class MarkdownEditor:
 
         self.current_folder = None
         self.setup_ui()
+        self.root.protocol('WM_DELETE_WINDOW', self._on_window_close)
 
     # ---- Editor property (delegates to active tab) ------------------------
 
@@ -505,10 +1625,7 @@ class MarkdownEditor:
 
         view_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="View", menu=view_menu)
-        view_menu.add_command(label="Toggle Preview", command=self.toggle_preview, accelerator="Cmd+\\")
-        view_menu.add_separator()
-        view_menu.add_command(label="Preview in Browser", command=self.preview_in_browser, accelerator="Cmd+P")
-        view_menu.add_command(label="Refresh Preview", command=self.update_preview, accelerator="Cmd+R")
+        view_menu.add_command(label="Toggle Terminal", command=self.toggle_terminal, accelerator="Cmd+J")
 
         search_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Search", menu=search_menu)
@@ -558,10 +1675,11 @@ class MarkdownEditor:
 
         # ---- Sidebar ----
         sidebar_frame = ttk.Frame(paned)
-        editor_frame = ttk.Frame(paned)
+        editor_paned = ttk.PanedWindow(paned, orient=tk.VERTICAL)
 
         paned.add(sidebar_frame, weight=0)
-        paned.add(editor_frame, weight=1)
+        paned.add(editor_paned, weight=1)
+        self.editor_paned = editor_paned
 
         # -- File tree panel (inside sidebar) --
         self.file_tree_frame = ttk.Frame(sidebar_frame)
@@ -670,23 +1788,40 @@ class MarkdownEditor:
 
         # -- Tabbed editor --
         self.tabbed_editor = TabbedEditor(
-            editor_frame,
+            editor_paned,
             on_tab_created=self._bind_editor_shortcuts,
             on_tab_switch=self._on_tab_switch,
             on_close_request=self._on_close_request,
             on_new_tab_request=self.new_file,
         )
-        self.tabbed_editor.pack(fill=tk.BOTH, expand=True)
+        editor_paned.add(self.tabbed_editor, weight=3)
+
+        # -- Terminal panel (hidden by default) --
+        self.terminal_panel = TerminalPanel(editor_paned)
+        self.terminal_panel.set_close_callback(self.toggle_terminal)
+        self._terminal_visible = False
 
         # -- Status bar --
-        self.status_bar = ttk.Label(self.root, text="Ready", relief=tk.SUNKEN, anchor="w")
-        self.status_bar.pack(fill=tk.X, side=tk.BOTTOM, padx=8)
+        status_frame = ttk.Frame(self.root)
+        status_frame.pack(fill=tk.X, side=tk.BOTTOM, padx=8)
+
+        self.status_bar = ttk.Label(
+            status_frame, text="Ready", relief=tk.SUNKEN, anchor='w')
+        self.status_bar.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        self._terminal_status = ttk.Label(
+            status_frame, text='⬆ Terminal', relief=tk.SUNKEN,
+            cursor='hand2', padding=(6, 1))
+        self._terminal_status.pack(side=tk.RIGHT)
+        self._terminal_status.bind(
+            '<Button-1>', lambda e: self.toggle_terminal())
+        # Update status bar widget references
+        self._status_frame = status_frame
 
     # ---- Shortcut binding for new editors ----------------------------------
 
     def _bind_editor_shortcuts(self, tab_id, editor):
         """Bind all keyboard shortcuts + events to a newly created editor."""
-        editor.bind("<KeyRelease>", self.on_text_change)
         editor.bind("<Command-n>", lambda _: self.new_file())
         editor.bind("<Command-o>", lambda _: self.open_file())
         editor.bind("<Command-s>", lambda _: self.save_file())
@@ -695,10 +1830,8 @@ class MarkdownEditor:
         editor.bind("<Command-i>", lambda _: self.insert_format("*", "*"))
         editor.bind("<Command-h>", lambda _: self.insert_heading())
         editor.bind("<Command-k>", lambda _: self.insert_link())
+        editor.bind("<Command-j>", lambda _: self.toggle_terminal())
         editor.bind("<Command-Shift-c>", lambda _: self.insert_format("`", "`"))
-        editor.bind("<Command-p>", lambda _: self.preview_in_browser())
-        editor.bind("<Command-r>", lambda _: self.update_preview())
-        editor.bind("<Command-backslash>", lambda _: self.toggle_preview())
         editor.bind("<Command-f>", lambda _: self.show_find_dialog())
         editor.bind("<Command-Shift-f>", lambda _: self.show_search_dialog())
         editor.bind("<Command-a>", lambda _: self.select_all())
@@ -708,11 +1841,31 @@ class MarkdownEditor:
         editor.bind("<Button-3>", self.show_editor_context_menu)
         editor.bind("<Control-Button-1>", self.show_editor_context_menu)
 
+    # ---- Terminal panel ----------------------------------------------------
+
+    def toggle_terminal(self):
+        """Show or hide the terminal panel."""
+        if self._terminal_visible:
+            self.editor_paned.forget(self.terminal_panel)
+            self._terminal_visible = False
+            self._terminal_status.configure(text='⬆ Terminal')
+            self.status_bar.configure(text='Terminal hidden')
+        else:
+            self.editor_paned.add(self.terminal_panel, weight=1)
+            self._terminal_visible = True
+            self._terminal_status.configure(text='⬇ Terminal')
+            self.status_bar.configure(text='Terminal shown')
+            self.terminal_panel.focus_input()
+
+    def _on_window_close(self):
+        """Clean up subprocesses before closing."""
+        self.terminal_panel.cleanup()
+        self.root.destroy()
+
     # ---- Tab event callbacks -----------------------------------------------
 
     def _on_tab_switch(self, tab_id):
         """Called when the active tab changes."""
-        self.update_preview()
         tab = self.tabbed_editor.get_active_tab()
         if tab and tab['file_path']:
             base = os.path.basename(tab['file_path'])
@@ -726,7 +1879,7 @@ class MarkdownEditor:
         if not tab:
             return
 
-        if tab['modified']:
+        if tab['editor'].is_modified():
             title = tab['title']
             result = messagebox.askyesnocancel(
                 "Unsaved Changes",
@@ -738,11 +1891,10 @@ class MarkdownEditor:
             elif result:          # Yes — save
                 if tab['file_path']:
                     try:
-                        content = tab['editor'].get(1.0, tk.END)
+                        content = tab['editor'].get_text()
                         with open(tab['file_path'], 'w', encoding='utf-8') as f:
                             f.write(content)
-                        self.tabbed_editor.set_tab_modified(tab_id, False)
-                        tab['editor'].edit_modified(False)
+                        tab['editor'].set_saved()
                     except Exception as e:
                         self.status_bar.config(text=f"Error saving: {e}")
                         return
@@ -852,29 +2004,14 @@ class MarkdownEditor:
                             new_content = f.read()
                         tab = self.tabbed_editor._tabs[tab_idx]
                         editor = tab['editor']
-                        # Unbind the <<Modified>> handler so the
-                        # programmatic delete/insert don't flag the
-                        # tab as modified.  Also disable undo so the
-                        # replacement isn't recorded in the undo stack.
-                        editor.unbind('<<Modified>>')
-                        editor.configure(undo=False)
-                        editor.delete(1.0, tk.END)
-                        editor.insert(tk.END, new_content)
-                        editor.edit_reset()
-                        editor.configure(undo=True)
-                        # Re-bind the handler that was set in add_tab()
-                        editor.bind('<<Modified>>',
-                            lambda e, tid=tab['id']: self.tabbed_editor._on_editor_modified(tid, e))
-                        self.tabbed_editor.set_tab_modified(tab['id'], False)
-                        if tab_idx == self.tabbed_editor.get_active_index():
-                            self.update_preview()
+                        editor.set_text(new_content)
+                        editor.set_saved()
                     except Exception as e:
                         self.status_bar.config(text=f"Error reloading file: {e}")
                 # Close diff tab for this file
                 diff_title = f'Diff: {name}'
                 for i, tab in enumerate(self.tabbed_editor._tabs):
                     if tab['title'] == diff_title:
-                        tab['modified'] = False
                         self.tabbed_editor.close_tab(i)
                         break
             else:
@@ -907,11 +2044,10 @@ class MarkdownEditor:
             if tab['title'] == title:
                 self.tabbed_editor.switch_to_tab(i)
                 # Update content
-                tab['editor'].delete(1.0, tk.END)
-                tab['editor'].insert(tk.END, content)
-                tab['editor'].edit_modified(False)
+                tab['editor'].set_text(content)
+                tab['editor'].set_saved()
                 return
-        self.tabbed_editor.add_tab(title=title, content=content, file_type='txt')
+        self.tabbed_editor.add_tab(title=title, content=content)
 
     def _update_git_buttons(self):
         """Show/hide git buttons based on current state."""
@@ -955,14 +2091,10 @@ class MarkdownEditor:
             self.status_bar.config(text=f"Error opening file: {e}")
             return
 
-        # Detect file type from extension
-        file_type = 'txt' if file_path.lower().endswith('.txt') else 'md'
-
         self.tabbed_editor.add_tab(
             title=os.path.basename(file_path),
             file_path=file_path,
             content=content,
-            file_type=file_type
         )
         self.status_bar.config(text=f"Opened: {os.path.basename(file_path)}")
 
@@ -971,11 +2103,10 @@ class MarkdownEditor:
     def _save_to_tab(self, tab):
         """Write a tab's editor content to its file_path."""
         try:
-            content = tab['editor'].get(1.0, tk.END)
+            content = tab['editor'].get_text()
             with open(tab['file_path'], 'w', encoding='utf-8') as f:
                 f.write(content)
-            self.tabbed_editor.set_tab_modified(tab['id'], False)
-            tab['editor'].edit_modified(False)
+            tab['editor'].set_saved()
             self.status_bar.config(text=f"Saved: {os.path.basename(tab['file_path'])}")
             return True
         except Exception as e:
@@ -985,24 +2116,20 @@ class MarkdownEditor:
     # ---- File operations ---------------------------------------------------
 
     def new_file(self):
-        """Create a new tab, asking for a filename to determine type."""
+        """Create a new tab, asking for a filename."""
         filename = simpledialog.askstring(
-            "New File", "Enter file name (e.g. notes.md, readme.txt):",
+            "New File", "Enter file name:",
             parent=self.root
         )
-        if filename:
-            file_type = 'txt' if filename.lower().endswith('.txt') else 'md'
-        else:
+        if not filename:
             filename = 'Untitled'
-            file_type = 'md'
-        self.tabbed_editor.add_tab(title=filename, content='', file_type=file_type)
-        self.update_preview()
+        self.tabbed_editor.add_tab(title=filename, content='')
         self.status_bar.config(text="New file")
 
     def open_file(self):
         file_path = filedialog.askopenfilename(
-            title="Open Markdown File",
-            filetypes=[("Markdown files", "*.md *.markdown"), ("Text files", "*.txt"), ("All files", "*.*")]
+            title="Open File",
+            filetypes=[("All files", "*.*")]
         )
         if file_path:
             self._open_file_in_tab(file_path)
@@ -1028,9 +2155,7 @@ class MarkdownEditor:
                             continue
                         node_id = self.file_tree.insert(parent_id, "end", text=f"📁 {item}", values=(full_path,), tags=("dir",), open=False)
                         add_tree_items(full_path, node_id)
-                    elif item.endswith(('.md', '.markdown')):
-                        self.file_tree.insert(parent_id, "end", text=f"📝 {item}", values=(full_path,), tags=("file",))
-                    elif item.endswith('.txt'):
+                    else:
                         self.file_tree.insert(parent_id, "end", text=f"📄 {item}", values=(full_path,), tags=("file",))
             except PermissionError:
                 pass
@@ -1051,7 +2176,7 @@ class MarkdownEditor:
             values = self.file_tree.item(item, "values")
             if values:
                 file_path = values[0]
-                if os.path.isfile(file_path) and file_path.endswith(('.md', '.markdown', '.txt')):
+                if os.path.isfile(file_path):
                     self._open_file_in_tab(file_path)
 
     def save_file(self):
@@ -1069,108 +2194,12 @@ class MarkdownEditor:
             return False
         file_path = filedialog.asksaveasfilename(
             title="Save File",
-            defaultextension=".md",
-            filetypes=[("Markdown files", "*.md"), ("Text files", "*.txt"), ("All files", "*.*")]
+            filetypes=[("All files", "*.*")]
         )
         if file_path:
             self.tabbed_editor.set_tab_path(tab['id'], file_path)
-            # Update file type based on new extension
-            new_type = 'txt' if file_path.lower().endswith('.txt') else 'md'
-            self.tabbed_editor.set_tab_file_type(tab['id'], new_type)
-            self.update_preview()
             return self._save_to_tab(tab)
         return False
-
-    # ---- Preview -----------------------------------------------------------
-
-    def on_text_change(self, event=None):
-        self.update_preview()
-
-    def update_preview(self):
-        editor = self.editor
-        if editor is None:
-            return
-        content = editor.get(1.0, tk.END)
-        html = markdown.markdown(
-            content,
-            extensions=['tables', 'fenced_code', 'nl2br', 'sane_lists']
-        )
-
-        styled_html = f'''<div style="font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;padding:20px;line-height:1.6;color:#24292f;">
-            {self._apply_inline_styles(html)}
-        </div>'''
-        self.tabbed_editor.update_active_preview(styled_html)
-
-    def _apply_inline_styles(self, html):
-        html = re.sub(r'<h1>(.*?)</h1>', r'<h1 style="font-size:2em;border-bottom:1px solid #d0d7de;padding-bottom:0.3em;margin-top:1.5em;margin-bottom:0.5em;font-weight:600;">\1</h1>', html)
-        html = re.sub(r'<h2>(.*?)</h2>', r'<h2 style="font-size:1.5em;border-bottom:1px solid #d0d7de;padding-bottom:0.3em;margin-top:1.5em;margin-bottom:0.5em;font-weight:600;">\1</h2>', html)
-        html = re.sub(r'<h3>(.*?)</h3>', r'<h3 style="font-size:1.25em;margin-top:1.5em;margin-bottom:0.5em;font-weight:600;">\1</h3>', html)
-        html = re.sub(r'<h4>(.*?)</h4>', r'<h4 style="font-size:1em;margin-top:1.5em;margin-bottom:0.5em;font-weight:600;">\1</h4>', html)
-        html = re.sub(r'<code>(.*?)</code>', r'<code style="background-color:#f6f8fa;padding:2px 6px;border-radius:3px;font-family:"Monaco","Courier New",monospace;font-size:0.9em;">\1</code>', html)
-        html = re.sub(r'<pre>(.*?)</pre>', r'<pre style="background-color:#f6f8fa;padding:16px;border-radius:6px;overflow-x:auto;">\1</pre>', html)
-        html = re.sub(r'<blockquote>(.*?)</blockquote>', r'<blockquote style="border-left:4px solid #d0d7de;padding-left:16px;color:#57606a;margin:0;">\1</blockquote>', html)
-        html = re.sub(r'<a href="(.*?)">(.*?)</a>', r'<a href="\1" style="color:#0969da;text-decoration:none;">\2</a>', html)
-        html = re.sub(r'<ul>(.*?)</ul>', r'<ul style="padding-left:2em;">\1</ul>', html)
-        html = re.sub(r'<ol>(.*?)</ol>', r'<ol style="padding-left:2em;">\1</ol>', html)
-        html = re.sub(r'<hr ?/?>', r'<hr style="border:none;border-top:1px solid #d0d7de;margin:2em 0;">', html)
-        html = re.sub(r'<p>(.*?)</p>', r'<p style="margin:0.5em 0;">\1</p>', html)
-        return html
-
-    def toggle_preview(self):
-        visible = self.tabbed_editor.toggle_preview()
-        if visible:
-            self.status_bar.config(text="Preview shown")
-        else:
-            self.status_bar.config(text="Preview hidden")
-        self.update_preview()
-
-    def preview_in_browser(self):
-        editor = self.editor
-        if editor is None:
-            return
-        content = editor.get(1.0, tk.END)
-        html = markdown.markdown(
-            content,
-            extensions=['tables', 'fenced_code', 'nl2br', 'sane_lists']
-        )
-
-        styled_html = f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <meta charset="UTF-8">
-            <title>Markdown Preview</title>
-            <style>
-                body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; padding: 40px; max-width: 800px; margin: 0 auto; line-height: 1.6; color: #24292f; }}
-                h1, h2, h3, h4, h5, h6 {{ margin-top: 1.5em; margin-bottom: 0.5em; font-weight: 600; }}
-                h1 {{ font-size: 2em; border-bottom: 1px solid #d0d7de; padding-bottom: 0.3em; }}
-                h2 {{ font-size: 1.5em; border-bottom: 1px solid #d0d7de; padding-bottom: 0.3em; }}
-                code {{ background-color: #f6f8fa; padding: 2px 6px; border-radius: 3px; font-family: 'Monaco', 'Courier New', monospace; font-size: 0.9em; }}
-                pre {{ background-color: #f6f8fa; padding: 16px; border-radius: 6px; overflow-x: auto; }}
-                pre code {{ background-color: transparent; padding: 0; }}
-                blockquote {{ border-left: 4px solid #d0d7de; padding-left: 16px; color: #57606a; margin: 0; }}
-                table {{ border-collapse: collapse; width: 100%; margin: 1em 0; }}
-                th, td {{ border: 1px solid #d0d7de; padding: 8px 12px; text-align: left; }}
-                th {{ background-color: #f6f8fa; font-weight: 600; }}
-                a {{ color: #0969da; text-decoration: none; }}
-                a:hover {{ text-decoration: underline; }}
-                img {{ max-width: 100%; }}
-                hr {{ border: none; border-top: 1px solid #d0d7de; margin: 2em 0; }}
-                ul, ol {{ padding-left: 2em; }}
-            </style>
-        </head>
-        <body>
-            {html}
-        </body>
-        </html>
-        """
-
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False) as f:
-            f.write(styled_html)
-            temp_path = f.name
-
-        webbrowser.open('file://' + temp_path)
-        self.status_bar.config(text="Opened preview in browser")
 
     # ---- Text formatting ---------------------------------------------------
 
@@ -1224,19 +2253,13 @@ class MarkdownEditor:
         editor = self.editor
         if editor is None:
             return
-        try:
-            editor.edit_undo()
-        except tk.TclError:
-            pass
+        editor.undo()
 
     def redo(self):
         editor = self.editor
         if editor is None:
             return
-        try:
-            editor.edit_redo()
-        except tk.TclError:
-            pass
+        editor.redo()
 
     def cut(self):
         editor = self.editor
@@ -1320,7 +2343,7 @@ class MarkdownEditor:
 
         if parent_path:
             filename = simpledialog.askstring(
-                "New File", "Enter file name (e.g. notes.md, readme.txt):",
+                "New File", "Enter file name:",
                 parent=self.root
             )
             if filename:
@@ -1394,11 +2417,10 @@ class MarkdownEditor:
                 existing = self.tabbed_editor.find_tab_by_path(path)
                 if existing >= 0:
                     # Force close without unsaved prompt (file already deleted)
-                    self.tabbed_editor._tabs[existing]['modified'] = False
+                    self.tabbed_editor._tabs[existing]['editor'].set_saved()
                     self.tabbed_editor.close_tab(existing)
                     if self.tabbed_editor.get_tab_count() == 0:
                         self.tabbed_editor.add_tab(content='')
-                        self.update_preview()
             except Exception as e:
                 self.status_bar.config(text=f"Error deleting: {e}")
 
@@ -1629,7 +2651,7 @@ class MarkdownEditor:
                     if os.path.isdir(full_path):
                         if not item.startswith('.'):
                             search_dir(full_path)
-                    elif item.endswith(('.md', '.markdown', '.txt')):
+                    elif os.path.isfile(full_path):
                         try:
                             with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
                                 content = f.read()

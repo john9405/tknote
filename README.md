@@ -1,3 +1,5 @@
 # tknote
 
-开发中
+In developing
+
+a editor base on idle
