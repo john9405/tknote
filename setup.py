@@ -3,7 +3,7 @@ py2app setup script for tknote
 """
 from setuptools import setup
 
-APP = ['__main__.py']
+APP = ['tknote/__main__.py']
 DATA_FILES = []
 OPTIONS = {
     'argv_emulation': False,
