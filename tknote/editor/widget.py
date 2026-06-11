@@ -15,6 +15,7 @@ from ..infra.undo import UndoDelegator
 from ..infra.color import ColorDelegator
 from ..infra.parenmatch import ParenMatch
 from ..infra.autoindent import AutoIndent
+from ..infra.keywordhint import KeywordHint
 
 
 # ── Editwin adapter (shared by ParenMatch and AutoComplete) ────────────────
@@ -67,12 +68,14 @@ class EndLineDelegator(Delegator):
         self.changed_callback = changed_callback
 
     def insert(self, index, chars, tags=None):
-        self.delegate.insert(index, chars, tags)
+        result = self.delegate.insert(index, chars, tags)
         self.changed_callback(_get_end_linenumber(self.delegate))
+        return result
 
     def delete(self, index1, index2=None):
-        self.delegate.delete(index1, index2)
+        result = self.delegate.delete(index1, index2)
         self.changed_callback(_get_end_linenumber(self.delegate))
+        return result
 
 
 # ── EditorWidget ───────────────────────────────────────────────────────────
@@ -104,10 +107,6 @@ class EditorWidget(tk.Frame):
     # ── UI construction ───────────────────────────────────────────────────
 
     def _build_ui(self):
-        # ── Text frame (holds main editor Text + scrollbar) ──
-        text_frame = tk.Frame(self)
-        text_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
         # ── Line-number sidebar (Text widget, not Canvas) ──
         self._line_text = tk.Text(
             self, width=1, wrap=tk.NONE,
@@ -123,6 +122,10 @@ class EditorWidget(tk.Frame):
         # Prepare for grid; show_sidebar / hide_sidebar manage visibility
         self._prev_end = 1
         self._line_text.pack(side=tk.LEFT, fill=tk.Y)
+
+        # ── Text frame (holds main editor Text + scrollbar) ──
+        text_frame = tk.Frame(self)
+        text_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         # ── Main editor Text ──
         self._text = tk.Text(
@@ -162,7 +165,9 @@ class EditorWidget(tk.Frame):
 
         self._undo = UndoDelegator()
         self._percolator.insertfilterafter(self._undo, after=self._endline)
-        self._undo.saved_change_hook = self._on_saved_changed
+        self._undo.set_saved_change_hook(self._on_saved_changed)
+        self._text.undo_block_start = self._undo.undo_block_start
+        self._text.undo_block_stop = self._undo.undo_block_stop
 
         self._color = ColorDelegator()
         self._percolator.insertfilter(self._color)
@@ -172,6 +177,8 @@ class EditorWidget(tk.Frame):
         self._auto_indent = AutoIndent(self._text, undo=self._undo)
         self._autocomplete = self._setup_autocomplete()
         self._calltip = self._setup_calltip()
+        self._keyword_hint = KeywordHint(self._text)
+        self._keyword_hint.attach()
 
         # ── Key bindings ──
         self._setup_bindings()
@@ -192,6 +199,16 @@ class EditorWidget(tk.Frame):
         text.bind('<Return>', self._auto_indent.newline_and_indent_event)
         text.bind('<Shift-Tab>', self._auto_indent.smart_backspace_event)
         text.bind('<BackSpace>', self._handle_backspace)
+        text.bind('<Home>', self._home_callback)
+        text.bind('<Shift-Home>', self._home_callback)
+
+        # Virtual events mirror idlelib's EditorWindow entry points.
+        text.bind('<<smart-indent>>', self._handle_tab)
+        text.bind('<<newline-and-indent>>',
+                  self._auto_indent.newline_and_indent_event)
+        text.bind('<<smart-backspace>>', self._auto_indent.smart_backspace_event)
+        text.bind('<<beginning-of-line>>', self._home_callback)
+        text.bind('<<center-insert>>', self.center_insert_event)
 
         # Autocomplete triggers
         text.bind('<Control-space>', self._autocomplete.force_open_completions_event)
@@ -205,6 +222,11 @@ class EditorWidget(tk.Frame):
         # Paren close → flash match
         for closer in (')', ']', '}'):
             text.bind(closer, self._on_paren_close)
+
+        # Keyword hint — force-show on Ctrl+Shift+K / Cmd+Shift+K
+        text.bind('<Control-Shift-K>', self._keyword_hint.force_show)
+        text.bind('<Command-Shift-K>', self._keyword_hint.force_show)
+
     def _setup_autocomplete(self):
         """Set up idlelib autocomplete with editwin adapter."""
         from idlelib.autocomplete import AutoComplete
@@ -244,6 +266,8 @@ class EditorWidget(tk.Frame):
 
         # Redirect mouse wheel
         lt.bind('<MouseWheel>', self._sidebar_mousewheel)
+        lt.bind('<Button-4>', self._sidebar_mousewheel)
+        lt.bind('<Button-5>', self._sidebar_mousewheel)
 
         # Redirect right-click
         lt.bind('<Button-2>', self._sidebar_button_redirect)
@@ -252,29 +276,49 @@ class EditorWidget(tk.Frame):
 
         # Line selection by drag on sidebar
         self._sidebar_drag_start = None
+        self._sidebar_drag_last_y = None
+        self._sidebar_autoscroll_after_id = None
         lt.bind('<Button-1>', self._sidebar_b1_down)
         lt.bind('<ButtonRelease-1>', self._sidebar_b1_up)
         lt.bind('<B1-Motion>', self._sidebar_b1_motion)
+        lt.bind('<B1-Leave>', self._sidebar_b1_leave)
+        lt.bind('<B1-Enter>', self._sidebar_b1_enter)
 
     # ── Scroll sync ───────────────────────────────────────────────────────
 
     def _on_scrollbar(self, *args):
         """Scrollbar command — syncs both main text and sidebar."""
         self._text.yview(*args)
-        self._line_text.yview_moveto(args[0])
+        self._sync_sidebar_yview()
 
     def _redirect_yscroll(self, *args):
         """Redirect yscrollcommand from main text to scrollbar + sidebar."""
         self._scrollbar.set(*args)
-        self._line_text.yview_moveto(args[0])
+        if args:
+            self._line_text.yview_moveto(args[0])
 
     def yview(self, *args):
-        self._text.yview(*args)
+        result = self._text.yview(*args)
+        if args:
+            self._sync_sidebar_yview()
+        return result
+
+    def _sync_sidebar_yview(self):
+        """Match the sidebar scroll position to the main text widget."""
+        try:
+            first, _last = self._text.yview()
+            self._line_text.yview_moveto(first)
+        except tk.TclError:
+            pass
 
     def _sidebar_mousewheel(self, event):
         """Redirect mousewheel from sidebar to main text."""
-        self._text.event_generate('<MouseWheel>', x=0, y=event.y,
-                                  delta=event.delta)
+        if getattr(event, 'num', None) in (4, 5):
+            direction = -1 if event.num == 4 else 1
+            self._text.yview_scroll(direction, 'units')
+        else:
+            self._text.event_generate('<MouseWheel>', x=0, y=event.y,
+                                      delta=event.delta)
         return 'break'
 
     def _sidebar_button_redirect(self, event):
@@ -287,27 +331,83 @@ class EditorWidget(tk.Frame):
 
     def _sidebar_b1_down(self, event):
         """Mouse-down on sidebar: start line selection."""
-        lineno = _get_lineno(self._text, f"@0,{event.y}")
+        self._text.focus_set()
+        lineno = self._sidebar_lineno_at_y(event.y)
         self._sidebar_drag_start = lineno
-        self._text.tag_remove("sel", "1.0", "end")
-        self._text.tag_add("sel", f"{lineno}.0", f"{lineno + 1}.0")
-        self._text.mark_set("insert", f"{lineno}.0")
+        self._sidebar_drag_last_y = event.y
+        self._sidebar_update_selection(event.y)
+        return 'break'
 
     def _sidebar_b1_up(self, event):
         """Mouse-up on sidebar: finish line selection."""
         self._sidebar_drag_start = None
+        self._sidebar_drag_last_y = None
+        self._cancel_sidebar_autoscroll()
         self._text.event_generate('<ButtonRelease-1>', x=0, y=event.y)
+        return 'break'
 
     def _sidebar_b1_motion(self, event):
         """Mouse-drag on sidebar: extend selection to dragged line."""
         if self._sidebar_drag_start is None:
             return
-        lineno = _get_lineno(self._text, f"@0,{event.y}")
+        self._sidebar_drag_last_y = event.y
+        self._sidebar_update_selection(event.y)
+        return 'break'
+
+    def _sidebar_b1_leave(self, event):
+        if self._sidebar_drag_start is None:
+            return
+        self._sidebar_drag_last_y = event.y
+        if self._sidebar_autoscroll_after_id is None:
+            self._sidebar_autoscroll_after_id = self._line_text.after(
+                0, self._sidebar_auto_scroll)
+
+    def _sidebar_b1_enter(self, event):
+        self._cancel_sidebar_autoscroll()
+
+    def _sidebar_lineno_at_y(self, y):
+        lineno = _get_lineno(self._text, f"@0,{y}")
+        return max(1, min(lineno, _get_end_linenumber(self._text)))
+
+    def _sidebar_update_selection(self, y):
+        if self._sidebar_drag_start is None:
+            return
+        lineno = self._sidebar_lineno_at_y(y)
         a = min(self._sidebar_drag_start, lineno)
         b = max(self._sidebar_drag_start, lineno)
         self._text.tag_remove("sel", "1.0", "end")
         self._text.tag_add("sel", f"{a}.0", f"{b + 1}.0")
-        self._text.mark_set("insert", f"{lineno}.0")
+        insert_line = lineno if lineno == a else lineno + 1
+        self._text.mark_set("insert", f"{insert_line}.0")
+        self._text.see("insert")
+
+    def _sidebar_auto_scroll(self):
+        self._sidebar_autoscroll_after_id = None
+        y = self._sidebar_drag_last_y
+        if self._sidebar_drag_start is None or y is None:
+            return
+
+        height = self._line_text.winfo_height()
+        if y < 0:
+            self._text.yview_scroll(-1 + y, 'pixels')
+            self._sidebar_update_selection(y)
+        elif y > height:
+            self._text.yview_scroll(1 + y - height, 'pixels')
+            self._sidebar_update_selection(y)
+        else:
+            return
+
+        self._sidebar_autoscroll_after_id = self._line_text.after(
+            50, self._sidebar_auto_scroll)
+
+    def _cancel_sidebar_autoscroll(self):
+        if self._sidebar_autoscroll_after_id is None:
+            return
+        try:
+            self._line_text.after_cancel(self._sidebar_autoscroll_after_id)
+        except tk.TclError:
+            pass
+        self._sidebar_autoscroll_after_id = None
 
     # ── Sidebar text update ───────────────────────────────────────────────
 
@@ -356,6 +456,70 @@ class EditorWidget(tk.Frame):
         self._paren_match.paren_closed_event(event)
         # Also perform the normal insertion (not break)
         return None
+
+    def _home_callback(self, event):
+        """Move between first nonblank character and physical line start."""
+        if event and (event.state & 4) != 0 and event.keysym == "Home":
+            return None
+
+        line = self._text.get("insert linestart", "insert lineend")
+        for insertpt, char in enumerate(line):
+            if char not in (' ', '\t'):
+                break
+        else:
+            insertpt = len(line)
+
+        current_col = int(self._text.index("insert").split('.')[1])
+        if insertpt == current_col:
+            insertpt = 0
+
+        dest = f"insert linestart+{insertpt}c"
+        if event and (event.state & 1) != 0:
+            self._extend_selection_to(dest)
+        else:
+            self._text.tag_remove("sel", "1.0", "end")
+
+        self._text.mark_set("insert", dest)
+        self._text.see("insert")
+        return "break"
+
+    def _extend_selection_to(self, dest):
+        """Extend the selection to dest using idlelib's Home-key behavior."""
+        try:
+            sel_first = self._text.index("sel.first")
+            sel_last = self._text.index("sel.last")
+        except tk.TclError:
+            self._text.mark_set("my_anchor", "insert")
+        else:
+            if self._text.compare(sel_first, "<", self._text.index("insert")):
+                self._text.mark_set("my_anchor", sel_first)
+            else:
+                self._text.mark_set("my_anchor", sel_last)
+
+        first = self._text.index(dest)
+        last = self._text.index("my_anchor")
+        if self._text.compare(first, ">", last):
+            first, last = last, first
+        self._text.tag_remove("sel", "1.0", "end")
+        self._text.tag_add("sel", first, last)
+
+    def center_insert_event(self, event=None):
+        """Center the insert cursor vertically in the editor viewport."""
+        self.center()
+        return "break"
+
+    def center(self, mark="insert"):
+        """Scroll so mark is near the vertical center, like idlelib."""
+        top, bottom = self._get_window_lines()
+        lineno = _get_lineno(self._text, mark)
+        height = max(1, bottom - top)
+        self._text.yview(max(0, lineno - height // 2))
+
+    def _get_window_lines(self):
+        top = _get_lineno(self._text, "@0,0")
+        bottom = _get_lineno(
+            self._text, f"@0,{max(0, self._text.winfo_height() - 1)}")
+        return top, max(top + 1, bottom)
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -420,6 +584,10 @@ class EditorWidget(tk.Frame):
         """Highlight surrounding brackets (menu / shortcut entry point)."""
         self._paren_match.flash_paren_event()
 
+    def show_keyword_hint(self):
+        """Force-show keyword hint for the word at the cursor."""
+        self._keyword_hint.force_show()
+
     # ── Text widget delegation ────────────────────────────────────────────
 
     def get(self, *args):
@@ -466,7 +634,13 @@ class EditorWidget(tk.Frame):
         self._undo.set_saved(1)
 
     def edit_modified(self, flag=None):
-        return False
+        if flag is None:
+            return self.is_modified()
+        if flag:
+            self._undo.set_saved(0)
+        else:
+            self._undo.set_saved(1)
+        return self.is_modified()
 
     def edit_undo(self):
         self.undo()
@@ -475,7 +649,7 @@ class EditorWidget(tk.Frame):
         self.redo()
 
     def edit_separator(self):
-        pass
+        self._undo.can_merge = False
 
     def focus_set(self):
         self._text.focus_set()
@@ -505,6 +679,8 @@ class EditorWidget(tk.Frame):
 
     def destroy(self):
         try:
+            self._cancel_sidebar_autoscroll()
+            self._keyword_hint.detach()
             self._color.close()
             self._percolator.close()
         except Exception:

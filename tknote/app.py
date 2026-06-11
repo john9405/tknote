@@ -22,6 +22,10 @@ class MarkdownEditor:
         self.setup_ui()
         self.root.protocol('WM_DELETE_WINDOW', self._on_window_close)
 
+    def _run_git(self, args):
+        """Run a git command in the currently opened folder."""
+        return run_git_command(args, cwd=self.current_folder)
+
     # ---- Editor property (delegates to active tab) ------------------------
 
     @property
@@ -63,6 +67,7 @@ class MarkdownEditor:
         edit_menu.add_command(label="Code", command=lambda: self.insert_format("`", "`"), accelerator="Cmd+Shift+C")
         edit_menu.add_separator()
         edit_menu.add_command(label="Flash Parens", command=self.flash_paren, accelerator="Cmd+Shift+P")
+        edit_menu.add_command(label="Keyword Hint", command=self.show_keyword_hint, accelerator="Cmd+Shift+K")
 
         view_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="View", menu=view_menu)
@@ -238,7 +243,7 @@ class MarkdownEditor:
         editor_paned.add(self.tabbed_editor, weight=3)
 
         # -- Terminal panel (hidden by default) --
-        self.terminal_panel = TerminalPanel(editor_paned)
+        self.terminal_panel = TerminalPanel(editor_paned, cwd=os.path.expanduser('~'))
         self.terminal_panel.set_close_callback(self.toggle_terminal)
         self._terminal_visible = False
 
@@ -279,6 +284,7 @@ class MarkdownEditor:
         editor.bind("<Command-z>", lambda _: self.undo())
         editor.bind("<Command-Shift-Z>", lambda _: self.redo())
         editor.bind("<Command-Shift-P>", lambda _: self.flash_paren())
+        editor.bind("<Command-Shift-K>", lambda _: self.show_keyword_hint())
         editor.bind("<Button-2>", self.show_editor_context_menu)
         editor.bind("<Button-3>", self.show_editor_context_menu)
         editor.bind("<Control-Button-1>", self.show_editor_context_menu)
@@ -380,11 +386,11 @@ class MarkdownEditor:
             self._update_git_buttons()
             return
 
-        _, branch, _ = run_git_command(['branch', '--show-current'])
+        _, branch, _ = self._run_git(['branch', '--show-current'])
         branch = branch.strip() if branch else 'unknown'
         self.git_branch_label.config(text=f"Branch: {branch}")
 
-        _, status, _ = run_git_command(['status', '--short'])
+        _, status, _ = self._run_git(['status', '--short'])
         self.git_status_text.config(state=tk.NORMAL)
         self.git_status_text.delete(1.0, tk.END)
         if status.strip():
@@ -434,7 +440,7 @@ class MarkdownEditor:
             parent=self.root
         )
         if confirm:
-            rc, _, stderr = run_git_command(['checkout', '--', rel_path])
+            rc, _, stderr = self._run_git(['checkout', '--', rel_path])
             if rc == 0:
                 self.status_bar.config(text=f"Rolled back: {name}")
                 self._refresh_git_panel()
@@ -475,9 +481,9 @@ class MarkdownEditor:
 
     def _show_diff_for(self, rel_path):
         """Create a tab showing git diff for the given relative path."""
-        _, diff, _ = run_git_command(['diff', '--', rel_path])
+        _, diff, _ = self._run_git(['diff', '--', rel_path])
         if not diff.strip():
-            _, diff, _ = run_git_command(['diff', '--cached', '--', rel_path])
+            _, diff, _ = self._run_git(['diff', '--cached', '--', rel_path])
 
         title = f'Diff: {os.path.basename(rel_path)}'
         content = diff if diff.strip() else '(no changes)'
@@ -581,6 +587,7 @@ class MarkdownEditor:
         if folder_path:
             self.current_folder = folder_path
             self.populate_file_tree(folder_path)
+            self.terminal_panel.cd_to(folder_path)
             self.status_bar.config(text=f"Opened folder: {os.path.basename(folder_path)}")
             self._update_git_buttons()
 
@@ -745,6 +752,13 @@ class MarkdownEditor:
         if editor is None:
             return
         editor.flash_paren()
+
+    def show_keyword_hint(self):
+        """Show Python keyword hint popup at cursor position."""
+        editor = self.editor
+        if editor is None:
+            return
+        editor.show_keyword_hint()
 
     def show_editor_context_menu(self, event):
         try:
@@ -1174,6 +1188,7 @@ class MarkdownEditor:
                     messagebox.showinfo("Success", "Repository cloned successfully", parent=self.root)
                     self.current_folder = dest
                     self.populate_file_tree(dest)
+                    self.terminal_panel.cd_to(dest)
                     self.status_bar.config(text=f"Opened: {os.path.basename(dest)}")
                     self._update_git_buttons()
                 else:
@@ -1205,7 +1220,7 @@ class MarkdownEditor:
             parent=self.root
         )
         if confirm:
-            returncode, stdout, stderr = run_git_command(['init'])
+            returncode, stdout, stderr = self._run_git(['init'])
             if returncode == 0:
                 self.status_bar.config(text="Git repository initialized")
                 messagebox.showinfo("Success", "Git repository initialized successfully", parent=self.root)
@@ -1219,12 +1234,12 @@ class MarkdownEditor:
             messagebox.showwarning("No Folder", "Please open a folder first", parent=self.root)
             return
 
-        returncode, _, _ = run_git_command(['status'])
+        returncode, _, _ = self._run_git(['status'])
         if returncode != 0:
             messagebox.showwarning("Not a Git Repository", "Please initialize git first", parent=self.root)
             return
 
-        returncode, stdout, _ = run_git_command(['remote', '-v'])
+        returncode, stdout, _ = self._run_git(['remote', '-v'])
         current_remote = ""
         if returncode == 0 and stdout.strip():
             current_remote = f"\nCurrent remotes:\n{stdout}"
@@ -1235,11 +1250,11 @@ class MarkdownEditor:
             parent=self.root
         )
         if remote_url:
-            returncode, _, _ = run_git_command(['remote', 'get-url', 'origin'])
+            returncode, _, _ = self._run_git(['remote', 'get-url', 'origin'])
             if returncode == 0:
-                returncode, stdout, stderr = run_git_command(['remote', 'set-url', 'origin', remote_url])
+                returncode, stdout, stderr = self._run_git(['remote', 'set-url', 'origin', remote_url])
             else:
-                returncode, stdout, stderr = run_git_command(['remote', 'add', 'origin', remote_url])
+                returncode, stdout, stderr = self._run_git(['remote', 'add', 'origin', remote_url])
 
             if returncode == 0:
                 self.status_bar.config(text="Remote set successfully")
@@ -1253,12 +1268,12 @@ class MarkdownEditor:
             messagebox.showwarning("No Folder", "Please open a folder first", parent=self.root)
             return
 
-        returncode, _, stderr = run_git_command(['status'])
+        returncode, _, stderr = self._run_git(['status'])
         if returncode != 0:
             messagebox.showwarning("Not a Git Repository", "Please initialize git first", parent=self.root)
             return
 
-        returncode, stdout, _ = run_git_command(['status', '--short'])
+        returncode, stdout, _ = self._run_git(['status', '--short'])
         status_text = stdout if stdout.strip() else "No changes to commit"
 
         commit_msg = simpledialog.askstring(
@@ -1267,12 +1282,12 @@ class MarkdownEditor:
             parent=self.root
         )
         if commit_msg:
-            returncode, stdout, stderr = run_git_command(['add', '.'])
+            returncode, stdout, stderr = self._run_git(['add', '.'])
             if returncode != 0:
                 messagebox.showerror("Error", f"Failed to stage files:\n{stderr}", parent=self.root)
                 return
 
-            returncode, stdout, stderr = run_git_command(['commit', '-m', commit_msg])
+            returncode, stdout, stderr = self._run_git(['commit', '-m', commit_msg])
             if returncode == 0:
                 self.status_bar.config(text=f"Committed: {commit_msg}")
                 messagebox.showinfo("Success", f"Changes committed:\n{commit_msg}", parent=self.root)
@@ -1285,14 +1300,14 @@ class MarkdownEditor:
             messagebox.showwarning("No Folder", "Please open a folder first", parent=self.root)
             return
 
-        returncode, _, _ = run_git_command(['status'])
+        returncode, _, _ = self._run_git(['status'])
         if returncode != 0:
             messagebox.showwarning("Not a Git Repository", "Please initialize git first", parent=self.root)
             return
 
         confirm = messagebox.askyesno("Git Pull", "Pull changes from remote?", parent=self.root)
         if confirm:
-            returncode, stdout, stderr = run_git_command(['pull'])
+            returncode, stdout, stderr = self._run_git(['pull'])
             if returncode == 0:
                 self.status_bar.config(text="Pull successful")
                 messagebox.showinfo("Success", f"Pull successful:\n{stdout}", parent=self.root)
@@ -1306,27 +1321,27 @@ class MarkdownEditor:
             messagebox.showwarning("No Folder", "Please open a folder first", parent=self.root)
             return
 
-        returncode, _, _ = run_git_command(['status'])
+        returncode, _, _ = self._run_git(['status'])
         if returncode != 0:
             messagebox.showwarning("Not a Git Repository", "Please initialize git first", parent=self.root)
             return
 
-        returncode, stdout, _ = run_git_command(['remote', 'get-url', 'origin'])
+        returncode, stdout, _ = self._run_git(['remote', 'get-url', 'origin'])
         if returncode != 0:
             messagebox.showwarning("No Remote", "Please set remote URL first", parent=self.root)
             return
 
-        returncode, branch_stdout, _ = run_git_command(['branch', '--show-current'])
+        returncode, branch_stdout, _ = self._run_git(['branch', '--show-current'])
         current_branch = branch_stdout.strip() if returncode == 0 else 'main'
 
-        returncode, _, _ = run_git_command(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'])
+        returncode, _, _ = self._run_git(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'])
 
         confirm = messagebox.askyesno("Git Push", "Push changes to remote?", parent=self.root)
         if confirm:
             if returncode != 0:
-                returncode, stdout, stderr = run_git_command(['push', '--set-upstream', 'origin', current_branch])
+                returncode, stdout, stderr = self._run_git(['push', '--set-upstream', 'origin', current_branch])
             else:
-                returncode, stdout, stderr = run_git_command(['push'])
+                returncode, stdout, stderr = self._run_git(['push'])
 
             if returncode == 0:
                 self.status_bar.config(text="Push successful")
@@ -1340,12 +1355,12 @@ class MarkdownEditor:
             messagebox.showwarning("No Folder", "Please open a folder first", parent=self.root)
             return
 
-        returncode, _, _ = run_git_command(['status'])
+        returncode, _, _ = self._run_git(['status'])
         if returncode != 0:
             messagebox.showwarning("Not a Git Repository", "Please initialize git first", parent=self.root)
             return
 
-        returncode, stdout, stderr = run_git_command(['log', '--oneline', '--graph', '--all', '-20'])
+        returncode, stdout, stderr = self._run_git(['log', '--oneline', '--graph', '--all', '-20'])
         if returncode != 0:
             messagebox.showerror("Error", f"Failed to get log:\n{stderr}", parent=self.root)
             return
@@ -1376,7 +1391,7 @@ class MarkdownEditor:
         log_text.config(state=tk.DISABLED)
 
     def refresh_git_log(self, log_text):
-        returncode, stdout, stderr = run_git_command(['log', '--oneline', '--graph', '--all', '-20'])
+        returncode, stdout, stderr = self._run_git(['log', '--oneline', '--graph', '--all', '-20'])
         log_text.config(state=tk.NORMAL)
         log_text.delete(1.0, tk.END)
         if returncode != 0:

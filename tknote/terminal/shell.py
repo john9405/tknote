@@ -90,16 +90,16 @@ class PythonShell(ttk.Frame):
 
     # Font and colors
     SHELL_FONT = ('Monaco', 11)
-    SHELL_BG = '#1e1e1e'
-    SHELL_FG = '#d4d4d4'
-    INSERT_BG = 'white'
+    SHELL_BG = '#ffffff'
+    SHELL_FG = '#1e1e1e'
+    INSERT_BG = '#1e1e1e'
 
     # Tag color schemes
     TAG_STYLES = {
-        'console': {'foreground': '#569cd6'},   # prompts: >>>, ...
-        'stdin':   {'foreground': '#d4d4d4'},   # user input
-        'stdout':  {'foreground': '#d4d4d4'},   # program output
-        'stderr':  {'foreground': '#f44747'},   # error output
+        'console': {'foreground': '#0451a5'},   # prompts: >>>, ...
+        'stdin':   {'foreground': '#1e1e1e'},   # user input
+        'stdout':  {'foreground': '#1e1e1e'},   # program output
+        'stderr':  {'foreground': '#d32f2f'},   # error output
     }
 
     def __init__(self, parent, **kwargs):
