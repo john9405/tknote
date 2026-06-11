@@ -172,10 +172,43 @@ class MarkdownEditor:
         git_header.pack(fill=tk.X, padx=5, pady=5)
         ttk.Label(git_header, text="Source Control", font=("Helvetica", 10, "bold")).pack(side=tk.LEFT)
 
-        self.git_branch_label = ttk.Label(
-            self.git_panel_frame, text="", font=("Helvetica", 10)
-        )
-        self.git_branch_label.pack(anchor="w", padx=10, pady=(5, 0))
+        # ---- Top buttons: repository setup (conditional) + commit area ----
+        git_btn_frame = ttk.Frame(self.git_panel_frame)
+        git_btn_frame.pack(fill=tk.X, padx=5, pady=5)
+        # Store button references for show/hide control
+        self._git_btns = {}
+
+        # Row 0: repository setup
+        self._git_btns['clone'] = ttk.Button(git_btn_frame, text="Clone", command=self.git_clone)
+        self._git_btns['clone'].grid(row=0, column=0, columnspan=2, padx=1, pady=1, sticky='ew')
+        self._git_btns['init'] = ttk.Button(git_btn_frame, text="Init", command=self.git_init)
+        self._git_btns['init'].grid(row=0, column=1, columnspan=2, padx=1, pady=1, sticky='ew')
+
+        # Row 1: remote setup
+        self._git_btns['remote'] = ttk.Button(git_btn_frame, text="Remote", command=self.git_set_remote)
+        self._git_btns['remote'].grid(row=1, column=0, columnspan=2, padx=1, pady=1, sticky='ew')
+
+        # Row 2: commit message entry
+        self._commit_msg_var = tk.StringVar()
+        self._commit_msg_entry = ttk.Entry(git_btn_frame, textvariable=self._commit_msg_var)
+        self._commit_msg_entry.grid(row=2, column=0, columnspan=2, padx=1, pady=(4, 1), sticky='ew')
+        self._commit_msg_entry.insert(0, "Enter commit message...")
+        self._commit_msg_entry.bind('<FocusIn>', self._on_commit_msg_focus_in)
+        self._commit_msg_entry.bind('<FocusOut>', self._on_commit_msg_focus_out)
+
+        # Row 3: commit + push buttons
+        self._git_btns['commit'] = ttk.Button(git_btn_frame, text="Commit", command=self.git_commit)
+        self._git_btns['commit'].grid(row=3, column=0, padx=1, pady=1, sticky='ew')
+        self._git_btns['push_panel'] = ttk.Button(git_btn_frame, text="Push", command=self.git_push)
+        self._git_btns['push_panel'].grid(row=3, column=1, padx=1, pady=1, sticky='ew')
+
+        git_btn_frame.columnconfigure(0, weight=1)
+        git_btn_frame.columnconfigure(1, weight=1)
+        self._update_git_buttons()
+
+        # ---- Changed files list ----
+        ttk.Label(self.git_panel_frame, text="Changed Files",
+                  font=("Helvetica", 10, "bold")).pack(anchor="w", padx=5, pady=(5, 0))
 
         git_status_frame = ttk.Frame(self.git_panel_frame)
         git_status_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
@@ -184,7 +217,7 @@ class MarkdownEditor:
         git_status_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
         self.git_status_text = tk.Text(
-            git_status_frame, height=10, font=("Monaco", 10),
+            git_status_frame, height=8, font=("Monaco", 10),
             yscrollcommand=git_status_scroll.set, state=tk.DISABLED,
             cursor='hand2'
         )
@@ -195,40 +228,31 @@ class MarkdownEditor:
         self.git_status_text.bind('<Control-Button-1>', self._on_git_status_right_click)
         git_status_scroll.config(command=self.git_status_text.yview)
 
-        # Git status context menu
+        # Git status context menu (right-click on changed files)
         self._git_context_menu = tk.Menu(self.root, tearoff=0)
         self._git_context_menu.add_command(label="Rollback", command=self._git_rollback)
         self._git_context_menu.add_command(label="Open File", command=self._git_open_selected)
         self._git_context_menu.add_command(label="Show Diff", command=self._git_show_diff)
+        self._git_context_menu.add_separator()
+        self._git_context_menu.add_command(label="Refresh", command=self._refresh_git_panel)
         self._git_right_clicked_file = None
 
-        git_btn_frame = ttk.Frame(self.git_panel_frame)
-        git_btn_frame.pack(fill=tk.X, padx=5, pady=5)
-        # Store button references for show/hide control
-        self._git_btns = {}
-        # Row 0: repository setup
-        self._git_btns['clone'] = ttk.Button(git_btn_frame, text="Clone", command=self.git_clone)
-        self._git_btns['clone'].grid(row=0, column=0, padx=1, pady=1, sticky='ew')
-        self._git_btns['init'] = ttk.Button(git_btn_frame, text="Init", command=self.git_init)
-        self._git_btns['init'].grid(row=0, column=1, padx=1, pady=1, sticky='ew')
-        # Row 1: remote + commit
-        self._git_btns['remote'] = ttk.Button(git_btn_frame, text="Remote", command=self.git_set_remote)
-        self._git_btns['remote'].grid(row=1, column=0, padx=1, pady=1, sticky='ew')
-        self._git_btns['commit'] = ttk.Button(git_btn_frame, text="Commit", command=self.git_commit)
-        self._git_btns['commit'].grid(row=1, column=1, padx=1, pady=1, sticky='ew')
-        # Row 2: push + pull
-        self._git_btns['push'] = ttk.Button(git_btn_frame, text="Push", command=self.git_push)
-        self._git_btns['push'].grid(row=2, column=0, padx=1, pady=1, sticky='ew')
-        self._git_btns['pull'] = ttk.Button(git_btn_frame, text="Pull", command=self.git_pull)
-        self._git_btns['pull'].grid(row=2, column=1, padx=1, pady=1, sticky='ew')
-        # Row 3: log + refresh
-        self._git_btns['log'] = ttk.Button(git_btn_frame, text="Log", command=self.show_git_log)
-        self._git_btns['log'].grid(row=3, column=0, padx=1, pady=1, sticky='ew')
-        self._git_btns['refresh'] = ttk.Button(git_btn_frame, text="Refresh", command=self._refresh_git_panel)
-        self._git_btns['refresh'].grid(row=3, column=1, padx=1, pady=1, sticky='ew')
-        git_btn_frame.columnconfigure(0, weight=1)
-        git_btn_frame.columnconfigure(1, weight=1)
-        self._update_git_buttons()
+        # ---- Commit log ----
+        ttk.Label(self.git_panel_frame, text="Commit Log",
+                  font=("Helvetica", 10, "bold")).pack(anchor="w", padx=5, pady=(5, 0))
+
+        log_frame = ttk.Frame(self.git_panel_frame)
+        log_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        log_scroll = ttk.Scrollbar(log_frame)
+        log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self._git_log_text = tk.Text(
+            log_frame, height=6, font=("Monaco", 10),
+            yscrollcommand=log_scroll.set, state=tk.DISABLED
+        )
+        self._git_log_text.pack(fill=tk.BOTH, expand=True)
+        log_scroll.config(command=self._git_log_text.yview)
 
         # Show file tree by default
         self.file_tree_frame.pack(fill=tk.BOTH, expand=True)
@@ -252,10 +276,32 @@ class MarkdownEditor:
         status_frame = ttk.Frame(self.root)
         status_frame.pack(fill=tk.X, side=tk.BOTTOM, padx=8)
 
+        # Left: git info frame (branch name + push + pull; always visible, disabled when no repo)
+        self._status_git_frame = ttk.Frame(status_frame)
+
+        self._status_branch_label = ttk.Label(
+            self._status_git_frame, text="⎇ no repo", font=("Helvetica", 10))
+        self._status_branch_label.pack(side=tk.LEFT, padx=(0, 8))
+        self._status_branch_label.bind('<Button-1>', self._show_branch_popup)
+
+        self._status_push_btn = ttk.Button(
+            self._status_git_frame, text="↑", command=self.git_push, width=1,
+            state=tk.DISABLED)
+        self._status_push_btn.pack(side=tk.LEFT, padx=1)
+
+        self._status_pull_btn = ttk.Button(
+            self._status_git_frame, text="↓", command=self.git_pull, width=1,
+            state=tk.DISABLED)
+        self._status_pull_btn.pack(side=tk.LEFT, padx=(1, 8))
+
+        self._status_git_frame.pack(side=tk.LEFT)
+
+        # Center: status text
         self.status_bar = ttk.Label(
             status_frame, text="Ready", relief=tk.SUNKEN, anchor='w')
         self.status_bar.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
+        # Right: terminal toggle
         self._terminal_status = ttk.Label(
             status_frame, text='⬆ Terminal', relief=tk.SUNKEN,
             cursor='hand2', padding=(6, 1))
@@ -377,20 +423,34 @@ class MarkdownEditor:
             self._refresh_git_panel()
 
     def _refresh_git_panel(self):
-        """Update the git panel with current branch and status."""
+        """Update the git panel with current branch, status, and log."""
         if not self.current_folder:
-            self.git_branch_label.config(text="No folder opened")
+            self._status_branch_label.config(text="⎇ no repo", cursor='')
+            self._status_push_btn.config(state=tk.DISABLED)
+            self._status_pull_btn.config(state=tk.DISABLED)
             self.git_status_text.config(state=tk.NORMAL)
             self.git_status_text.delete(1.0, tk.END)
             self.git_status_text.insert(tk.END, "Open a folder to see git status.")
             self.git_status_text.config(state=tk.DISABLED)
+            self._git_log_text.config(state=tk.NORMAL)
+            self._git_log_text.delete(1.0, tk.END)
+            self._git_log_text.config(state=tk.DISABLED)
             self._update_git_buttons()
             return
 
-        _, branch, _ = self._run_git(['branch', '--show-current'])
-        branch = branch.strip() if branch else 'unknown'
-        self.git_branch_label.config(text=f"Branch: {branch}")
+        has_git = os.path.isdir(os.path.join(self.current_folder, '.git'))
+        if not has_git:
+            self._status_branch_label.config(text="⎇ no repo", cursor='')
+            self._status_push_btn.config(state=tk.DISABLED)
+            self._status_pull_btn.config(state=tk.DISABLED)
+        else:
+            _, branch, _ = self._run_git(['branch', '--show-current'])
+            branch = branch.strip() if branch else 'unknown'
+            self._status_branch_label.config(text=f"⎇ {branch}", cursor='hand2')
+            self._status_push_btn.config(state=tk.NORMAL)
+            self._status_pull_btn.config(state=tk.NORMAL)
 
+        # Changed files
         _, status, _ = self._run_git(['status', '--short'])
         self.git_status_text.config(state=tk.NORMAL)
         self.git_status_text.delete(1.0, tk.END)
@@ -399,6 +459,9 @@ class MarkdownEditor:
         else:
             self.git_status_text.insert(tk.END, "Working tree clean")
         self.git_status_text.config(state=tk.DISABLED)
+
+        # Commit log
+        self._refresh_commit_log()
         self._update_git_buttons()
 
     def _parse_git_status_line(self, event):
@@ -517,12 +580,21 @@ class MarkdownEditor:
         else:
             self._git_btns['init'].grid_remove()
 
-        # All other buttons: visible only when folder is open
-        for name in ('remote', 'commit', 'push', 'pull', 'log', 'refresh'):
-            if folder_open:
-                self._git_btns[name].grid()
-            else:
-                self._git_btns[name].grid_remove()
+        # Remote: visible only when folder is open
+        if folder_open:
+            self._git_btns['remote'].grid()
+        else:
+            self._git_btns['remote'].grid_remove()
+
+        # Commit msg entry, commit button, push button: visible when folder is open
+        if folder_open and has_git:
+            self._commit_msg_entry.grid()
+            self._git_btns['commit'].grid()
+            self._git_btns['push_panel'].grid()
+        else:
+            self._commit_msg_entry.grid_remove()
+            self._git_btns['commit'].grid_remove()
+            self._git_btns['push_panel'].grid_remove()
 
     # ---- File opening helpers ----------------------------------------------
 
@@ -1281,14 +1353,14 @@ class MarkdownEditor:
             messagebox.showwarning("Not a Git Repository", "Please initialize git first", parent=self.root)
             return
 
-        returncode, stdout, _ = self._run_git(['status', '--short'])
-        status_text = stdout if stdout.strip() else "No changes to commit"
-
-        commit_msg = simpledialog.askstring(
-            "Git Commit",
-            f"Git Status:\n{status_text}\n\nEnter commit message:",
-            parent=self.root
-        )
+        # Get commit message from the entry field, fall back to dialog if placeholder
+        commit_msg = self._commit_msg_var.get().strip()
+        if not commit_msg or commit_msg == "Enter commit message...":
+            commit_msg = simpledialog.askstring(
+                "Git Commit",
+                "Enter commit message:",
+                parent=self.root
+            )
         if commit_msg:
             returncode, stdout, stderr = self._run_git(['add', '.'])
             if returncode != 0:
@@ -1298,7 +1370,10 @@ class MarkdownEditor:
             returncode, stdout, stderr = self._run_git(['commit', '-m', commit_msg])
             if returncode == 0:
                 self.status_bar.config(text=f"Committed: {commit_msg}")
+                self._commit_msg_var.set("")
+                self._commit_msg_entry.insert(0, "Enter commit message...")
                 messagebox.showinfo("Success", f"Changes committed:\n{commit_msg}", parent=self.root)
+                self._refresh_git_panel()
             else:
                 self.status_bar.config(text=f"Commit failed: {stderr}")
                 messagebox.showerror("Error", f"Failed to commit:\n{stderr}", parent=self.root)
@@ -1320,6 +1395,7 @@ class MarkdownEditor:
                 self.status_bar.config(text="Pull successful")
                 messagebox.showinfo("Success", f"Pull successful:\n{stdout}", parent=self.root)
                 self.populate_file_tree(self.current_folder)
+                self._refresh_git_panel()
             else:
                 self.status_bar.config(text=f"Pull failed: {stderr}")
                 messagebox.showerror("Error", f"Failed to pull:\n{stderr}", parent=self.root)
@@ -1357,6 +1433,133 @@ class MarkdownEditor:
             else:
                 self.status_bar.config(text=f"Push failed: {stderr}")
                 messagebox.showerror("Error", f"Failed to push:\n{stderr}", parent=self.root)
+
+    def _refresh_commit_log(self):
+        """Refresh the inline commit log widget."""
+        if not self.current_folder:
+            return
+        returncode, stdout, stderr = self._run_git(
+            ['log', '--oneline', '--graph', '--all', '-20'])
+        self._git_log_text.config(state=tk.NORMAL)
+        self._git_log_text.delete(1.0, tk.END)
+        if returncode != 0:
+            self._git_log_text.insert(tk.END, f"Error: {stderr}")
+        elif not stdout.strip():
+            self._git_log_text.insert(tk.END, "No commits yet")
+        else:
+            self._git_log_text.insert(tk.END, stdout)
+        self._git_log_text.config(state=tk.DISABLED)
+
+    def _on_commit_msg_focus_in(self, event):
+        """Clear placeholder text when entry gets focus."""
+        if self._commit_msg_var.get() == "Enter commit message...":
+            self._commit_msg_var.set("")
+
+    def _on_commit_msg_focus_out(self, event):
+        """Restore placeholder text when entry loses focus and is empty."""
+        if not self._commit_msg_var.get().strip():
+            self._commit_msg_var.set("Enter commit message...")
+
+    # ---- Branch management popup -----------------------------------------
+
+    def _show_branch_popup(self, event=None):
+        """Show a popup dialog listing local branches, with switch and create actions."""
+        if not self.current_folder:
+            return
+
+        has_git = os.path.isdir(os.path.join(self.current_folder, '.git'))
+        if not has_git:
+            return
+
+        # Get branch info
+        _, current_branch, _ = self._run_git(['branch', '--show-current'])
+        current_branch = current_branch.strip()
+
+        _, output, _ = self._run_git(['branch'])
+        branches = [b.lstrip('* ').strip() for b in output.splitlines() if b.strip()]
+
+        popup = tk.Toplevel(self.root)
+        popup.title("Branches")
+        popup.geometry("300x350")
+        popup.transient(self.root)
+        popup.grab_set()
+
+        ttk.Label(popup, text="Local Branches",
+                  font=("Helvetica", 11, "bold")).pack(anchor="w", padx=10, pady=(10, 5))
+
+        list_frame = ttk.Frame(popup)
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        list_scroll = ttk.Scrollbar(list_frame)
+        list_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        branch_list = tk.Listbox(list_frame, yscrollcommand=list_scroll.set,
+                                 font=("Monaco", 11), selectmode=tk.SINGLE)
+        branch_list.pack(fill=tk.BOTH, expand=True)
+        list_scroll.config(command=branch_list.yview)
+
+        # Populate branches, select current
+        for i, b in enumerate(branches):
+            branch_list.insert(tk.END, b)
+            if b == current_branch:
+                branch_list.selection_set(i)
+                branch_list.see(i)
+                branch_list.itemconfig(i, {'bg': '#d0e0f0'})
+
+        def do_switch():
+            sel = branch_list.curselection()
+            if not sel:
+                return
+            target = branch_list.get(sel[0])
+            if target == current_branch:
+                return
+            self._switch_to_branch(target, popup)
+
+        def do_create():
+            self._create_and_switch_branch(popup, current_branch)
+
+        # Double-click to switch
+        branch_list.bind('<Double-Button-1>', lambda e: do_switch())
+
+        btn_frame = ttk.Frame(popup)
+        btn_frame.pack(fill=tk.X, padx=10, pady=(5, 10))
+
+        ttk.Button(btn_frame, text="Switch", command=do_switch).pack(side=tk.LEFT)
+        ttk.Button(btn_frame, text="New", command=do_create).pack(side=tk.LEFT)
+        ttk.Button(btn_frame, text="Close", command=popup.destroy).pack(side=tk.RIGHT)
+
+    def _switch_to_branch(self, branch_name, popup):
+        """Check out the given branch and refresh state."""
+        returncode, _, stderr = self._run_git(['checkout', branch_name])
+        if returncode != 0:
+            messagebox.showerror("Switch Branch Failed",
+                                 f"Could not switch to '{branch_name}':\n{stderr}",
+                                 parent=self.root)
+            return
+        self.status_bar.config(text=f"Switched to branch: {branch_name}")
+        popup.destroy()
+        self._refresh_git_panel()
+        self.populate_file_tree(self.current_folder)
+
+    def _create_and_switch_branch(self, popup, current_branch):
+        """Create a new branch from current branch and switch to it."""
+        new_name = simpledialog.askstring(
+            "New Branch", "Enter new branch name:",
+            parent=popup
+        )
+        if not new_name:
+            return
+
+        returncode, _, stderr = self._run_git(['checkout', '-b', new_name])
+        if returncode != 0:
+            messagebox.showerror("Create Branch Failed",
+                                 f"Could not create branch '{new_name}':\n{stderr}",
+                                 parent=self.root)
+            return
+        self.status_bar.config(text=f"Created and switched to branch: {new_name}")
+        popup.destroy()
+        self._refresh_git_panel()
+        self.populate_file_tree(self.current_folder)
 
     def show_git_log(self):
         if not self.current_folder:
