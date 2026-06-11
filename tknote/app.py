@@ -45,6 +45,7 @@ class MarkdownEditor:
         file_menu.add_command(label="New", command=self.new_file, accelerator="Cmd+N")
         file_menu.add_command(label="Open", command=self.open_file, accelerator="Cmd+O")
         file_menu.add_command(label="Open Folder", command=self.open_folder, accelerator="Cmd+Shift+O")
+        file_menu.add_command(label="Close Folder", command=self.close_folder)
         file_menu.add_command(label="Save", command=self.save_file, accelerator="Cmd+S")
         file_menu.add_command(label="Save As", command=self.save_file_as, accelerator="Cmd+Shift+S")
         file_menu.add_separator()
@@ -589,7 +590,14 @@ class MarkdownEditor:
             self.populate_file_tree(folder_path)
             self.terminal_panel.cd_to(folder_path)
             self.status_bar.config(text=f"Opened folder: {os.path.basename(folder_path)}")
-            self._update_git_buttons()
+            self._refresh_git_panel()
+
+    def close_folder(self):
+        """Close the currently opened folder, clear file tree and git panel."""
+        self.current_folder = None
+        self.file_tree.delete(*self.file_tree.get_children())
+        self._refresh_git_panel()
+        self.status_bar.config(text="Folder closed")
 
     def populate_file_tree(self, folder_path):
         self.file_tree.delete(*self.file_tree.get_children())
