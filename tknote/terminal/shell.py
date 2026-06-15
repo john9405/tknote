@@ -1,6 +1,7 @@
 """PythonShell — idlelib-style single-Text-widget Python shell with iomark."""
 
 import code
+import os
 import sys
 import tkinter as tk
 from tkinter import ttk
@@ -104,10 +105,12 @@ class PythonShell(ttk.Frame):
 
     def __init__(self, parent, **kwargs):
         super().__init__(parent, **kwargs)
+        self._close_callback = None
         self._console = None
         self._locals = {}
         self._history = None
         self._auto_indent = None
+        self._added_sys_paths: list[str] = []
         self._build_ui()
         self._setup_percolator()
         self._setup_tags()
@@ -117,12 +120,27 @@ class PythonShell(ttk.Frame):
     # ── UI construction ───────────────────────────────────────────────────
 
     def _build_ui(self):
-        self.grid_rowconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1)
         self.grid_columnconfigure(0, weight=1)
+
+        # Header bar
+        header = ttk.Frame(self)
+        header.grid(row=0, column=0, sticky='ew')
+
+        ttk.Label(header, text='Python Shell', font=('Helvetica', 10, 'bold')).pack(
+            side=tk.LEFT, padx=(4, 0), pady=(2, 0))
+
+        close_btn = ttk.Button(
+            header, text='×', width=2, command=self._on_close)
+        close_btn.pack(side=tk.RIGHT, padx=(0, 4), pady=(2, 0))
+
+        # Separator
+        ttk.Separator(self, orient=tk.HORIZONTAL).grid(
+            row=1, column=0, sticky='ew')
 
         # Main shell Text widget
         text_frame = tk.Frame(self, bg=self.SHELL_BG)
-        text_frame.grid(row=0, column=0, sticky='nsew')
+        text_frame.grid(row=2, column=0, sticky='nsew')
         text_frame.grid_rowconfigure(0, weight=1)
         text_frame.grid_columnconfigure(0, weight=1)
 
@@ -149,6 +167,16 @@ class PythonShell(ttk.Frame):
         self._scrollbar.grid(row=0, column=1, sticky='ns')
 
         self._text.configure(yscrollcommand=self._scrollbar.set)
+
+    # ── Close button ──────────────────────────────────────────────────────
+
+    def set_close_callback(self, callback):
+        """Called when the close (×) button is clicked."""
+        self._close_callback = callback
+
+    def _on_close(self):
+        if self._close_callback:
+            self._close_callback()
 
     # ── Percolator chain ──────────────────────────────────────────────────
 
@@ -354,6 +382,34 @@ class PythonShell(ttk.Frame):
         self._text.focus_set()
         self._text.mark_set("insert", "end-1c")
         self._text.see("insert")
+
+    def set_venv(self, site_packages_path: str | None):
+        """Activate or deactivate a venv in the Python shell.
+
+        On activation: calls site.addsitedir() to process .pth files and
+        make the venv's packages importable.
+        On deactivation (None): removes the paths that were added.
+
+        Imported modules from the venv are NOT unloaded — matching the
+        behaviour of 'deactivate' in a real terminal.
+        """
+        if site_packages_path and os.path.isdir(site_packages_path):
+            import site
+            before = set(sys.path)
+            site.addsitedir(site_packages_path)
+            after = set(sys.path)
+            self._added_sys_paths = list(after - before)
+            name = os.path.basename(os.path.dirname(site_packages_path))
+            self.write(f'[Venv: {name}]\n', 'stdout')
+        else:
+            if self._added_sys_paths:
+                for p in self._added_sys_paths:
+                    try:
+                        sys.path.remove(p)
+                    except ValueError:
+                        pass
+                self._added_sys_paths = []
+            self.write('[Venv: system Python]\n', 'stdout')
 
     def cleanup(self):
         """Clean up colorizer and percolator."""

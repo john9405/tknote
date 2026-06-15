@@ -8,7 +8,10 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from .editor.tabbed import TabbedEditor
 from .editor.widget import EditorWidget
-from .terminal.panel import TerminalPanel
+from .terminal.shell import PythonShell
+from .terminal.packages import PackageManager
+from .terminal.terminal import SystemTerminal
+from .venv_manager import VenvManager
 from .git_ops import run_git_command
 
 
@@ -19,6 +22,7 @@ class MarkdownEditor:
         self.root.geometry("1200x700")
 
         self.current_folder = None
+        self.venv_manager = VenvManager()
         self.setup_ui()
         self.root.protocol('WM_DELETE_WINDOW', self._on_window_close)
 
@@ -72,7 +76,7 @@ class MarkdownEditor:
 
         view_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="View", menu=view_menu)
-        view_menu.add_command(label="Toggle Terminal", command=self.toggle_terminal, accelerator="Cmd+J")
+        view_menu.add_command(label="Toggle Terminal", command=self._toggle_terminal, accelerator="Cmd+J")
 
         search_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Search", menu=search_menu)
@@ -267,10 +271,16 @@ class MarkdownEditor:
         )
         editor_paned.add(self.tabbed_editor, weight=3)
 
-        # -- Terminal panel (hidden by default) --
-        self.terminal_panel = TerminalPanel(editor_paned, cwd=os.path.expanduser('~'))
-        self.terminal_panel.set_close_callback(self.toggle_terminal)
-        self._terminal_visible = False
+        # -- Bottom panels (hidden by default) --
+        cwd = os.path.expanduser('~')
+        self._shell_panel = PythonShell(editor_paned)
+        self._shell_panel.set_close_callback(self._toggle_shell)
+
+        self._pkg_panel = PackageManager(editor_paned)
+        self._pkg_panel.set_close_callback(self._toggle_packages)
+
+        self._sys_term = SystemTerminal(editor_paned, cwd=cwd)
+        self._sys_term.set_close_callback(self._toggle_terminal)
 
         # -- Status bar --
         status_frame = ttk.Frame(self.root)
@@ -301,13 +311,35 @@ class MarkdownEditor:
             status_frame, text="Ready", relief=tk.SUNKEN, anchor='w')
         self.status_bar.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
+        # Right (packed before terminal so it appears to its left):
+        # Python environment indicator
+        self._venv_status = ttk.Label(
+            status_frame, text='Python', relief=tk.SUNKEN,
+            cursor='hand2', padding=(6, 1))
+        self._venv_status.pack(side=tk.LEFT)
+        self._venv_status.bind('<Button-1>', lambda e: self._show_venv_popup())
+
         # Right: terminal toggle
         self._terminal_status = ttk.Label(
             status_frame, text='⬆ Terminal', relief=tk.SUNKEN,
             cursor='hand2', padding=(6, 1))
         self._terminal_status.pack(side=tk.RIGHT)
         self._terminal_status.bind(
-            '<Button-1>', lambda e: self.toggle_terminal())
+            '<Button-1>', lambda e: self._toggle_terminal())
+
+        # Right: python shell entry
+        self._shell_status = ttk.Label(
+            status_frame, text='▶ Shell', relief=tk.SUNKEN,
+            cursor='hand2', padding=(6, 1))
+        self._shell_status.pack(side=tk.RIGHT)
+        self._shell_status.bind('<Button-1>', lambda e: self._toggle_shell())
+
+        # Right: packages entry
+        self._pkg_status = ttk.Label(
+            status_frame, text='📦 Packages', relief=tk.SUNKEN,
+            cursor='hand2', padding=(6, 1))
+        self._pkg_status.pack(side=tk.RIGHT)
+        self._pkg_status.bind('<Button-1>', lambda e: self._toggle_packages())
         # Update status bar widget references
         self._status_frame = status_frame
 
@@ -323,7 +355,7 @@ class MarkdownEditor:
         editor.bind("<Command-i>", lambda _: self.insert_format("*", "*"))
         editor.bind("<Command-h>", lambda _: self.insert_heading())
         editor.bind("<Command-k>", lambda _: self.insert_link())
-        editor.bind("<Command-j>", lambda _: self.toggle_terminal())
+        editor.bind("<Command-j>", lambda _: self._toggle_terminal())
         editor.bind("<Command-Shift-c>", lambda _: self.insert_format("`", "`"))
         editor.bind("<Command-f>", lambda _: self.show_find_dialog())
         editor.bind("<Command-Shift-f>", lambda _: self.show_search_dialog())
@@ -336,26 +368,172 @@ class MarkdownEditor:
         editor.bind("<Button-3>", self.show_editor_context_menu)
         editor.bind("<Control-Button-1>", self.show_editor_context_menu)
 
-    # ---- Terminal panel ----------------------------------------------------
+    # ---- Bottom panels (Shell / Packages / Terminal) -----------------------
 
-    def toggle_terminal(self):
-        """Show or hide the terminal panel."""
-        if self._terminal_visible:
-            self.editor_paned.forget(self.terminal_panel)
-            self._terminal_visible = False
-            self._terminal_status.configure(text='⬆ Terminal')
-            self.status_bar.configure(text='Terminal hidden')
-        else:
-            self.editor_paned.add(self.terminal_panel, weight=1)
-            self._terminal_visible = True
-            self._terminal_status.configure(text='⬇ Terminal')
-            self.status_bar.configure(text='Terminal shown')
-            self.terminal_panel.focus_input()
+    def _show_bottom_panel(self, panel):
+        """Toggle a bottom panel. Hide any other visible panel first.
+
+        Returns True if the panel is now visible, False if it was hidden.
+        """
+        if panel.winfo_ismapped():
+            self.editor_paned.forget(panel)
+            return False
+        # Hide any other visible bottom panel
+        for p in [self._shell_panel, self._pkg_panel, self._sys_term]:
+            if p is not panel and p.winfo_ismapped():
+                self.editor_paned.forget(p)
+        self.editor_paned.add(panel, weight=1)
+        panel.focus_input()
+        return True
+
+    def _toggle_shell(self):
+        """Show or hide the Python Shell panel."""
+        visible = self._show_bottom_panel(self._shell_panel)
+        self._shell_status.configure(text='⏹ Shell' if visible else '▶ Shell')
+        self.status_bar.configure(
+            text='Python Shell shown' if visible else 'Python Shell hidden')
+
+    def _toggle_packages(self):
+        """Show or hide the Packages panel."""
+        visible = self._show_bottom_panel(self._pkg_panel)
+        self._pkg_status.configure(
+            text='⏹ Packages' if visible else '📦 Packages')
+        self.status_bar.configure(
+            text='Packages shown' if visible else 'Packages hidden')
+
+    def _toggle_terminal(self):
+        """Show or hide the system Terminal panel."""
+        visible = self._show_bottom_panel(self._sys_term)
+        self._terminal_status.configure(
+            text='⬇ Terminal' if visible else '⬆ Terminal')
+        self.status_bar.configure(
+            text='Terminal shown' if visible else 'Terminal hidden')
+
+    def _show_shell(self):
+        """Show the Python Shell panel (called from status bar)."""
+        if not self._shell_panel.winfo_ismapped():
+            self._toggle_shell()
+
+    def _show_packages(self):
+        """Show the Packages panel (called from status bar)."""
+        if not self._pkg_panel.winfo_ismapped():
+            self._toggle_packages()
 
     def _on_window_close(self):
         """Clean up subprocesses before closing."""
-        self.terminal_panel.cleanup()
+        self._shell_panel.cleanup()
+        self._sys_term.cleanup()
         self.root.destroy()
+
+    # ---- Python environment management -------------------------------------
+
+    def _update_venv_status(self):
+        """Refresh the venv indicator label in the status bar."""
+        if not self.current_folder:
+            self._venv_status.config(text='Python')
+            return
+        name = self.venv_manager.get_display_name()
+        self._venv_status.config(text=name)
+
+    def _show_venv_popup(self, event=None):
+        """Show a popup menu for selecting/creating Python environments."""
+        if not self.current_folder:
+            self.status_bar.config(text="Open a folder first to manage Python environments")
+            return
+
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="Python Environment", state=tk.DISABLED)
+        menu.add_separator()
+
+        # System Python (always available)
+        active = self.venv_manager.venv_path
+        label = "✓ System Python" if not active else "System Python"
+        menu.add_command(label=label, command=self._deactivate_venv)
+
+        # Auto-detected venvs in the project folder
+        detected = self.venv_manager.detect_venvs()
+        if detected:
+            menu.add_separator()
+            for vp in detected:
+                name = os.path.basename(vp)
+                if vp == active:
+                    label = f"✓ {name}"
+                else:
+                    label = f"    {name}"
+                menu.add_command(
+                    label=label,
+                    command=lambda p=vp: self._select_venv(p))
+
+        menu.add_separator()
+        menu.add_command(label="Create New Venv...", command=self._create_venv)
+        menu.add_command(label="Locate Existing...", command=self._locate_venv)
+
+        if self.venv_manager.is_active:
+            menu.add_separator()
+            menu.add_command(label="Deactivate", command=self._deactivate_venv)
+
+        try:
+            menu.post(
+                self._venv_status.winfo_rootx(),
+                self._venv_status.winfo_rooty() + self._venv_status.winfo_height())
+        finally:
+            # Keep menu alive until dismissed
+            menu.grab_release()
+
+    def _select_venv(self, venv_path):
+        """Activate a selected virtual environment."""
+        try:
+            self.venv_manager.activate(venv_path)
+            self._apply_venv_to_subsystems()
+            self._update_venv_status()
+            self.status_bar.config(
+                text=f"Python env: {self.venv_manager.get_display_name()}")
+        except ValueError as e:
+            messagebox.showerror("Venv Error", str(e), parent=self.root)
+
+    def _create_venv(self):
+        """Create a new virtual environment in the current project folder."""
+        name = simpledialog.askstring(
+            "Create Virtual Environment",
+            "Enter environment name:",
+            initialvalue=".venv",
+            parent=self.root)
+        if not name:
+            return
+        try:
+            self.venv_manager.create_venv(name)
+            self._apply_venv_to_subsystems()
+            self._update_venv_status()
+            self.status_bar.config(
+                text=f"Created and activated: {name}")
+        except Exception as e:
+            messagebox.showerror(
+                "Error", f"Failed to create venv:\n{e}", parent=self.root)
+
+    def _locate_venv(self):
+        """Browse the filesystem for an existing venv directory."""
+        path = filedialog.askdirectory(
+            title="Select Python Virtual Environment",
+            parent=self.root)
+        if path:
+            self._select_venv(path)
+
+    def _deactivate_venv(self):
+        """Revert to system Python."""
+        if not self.venv_manager.is_active:
+            return
+        self.venv_manager.deactivate()
+        self._apply_venv_to_subsystems()
+        self._update_venv_status()
+        self.status_bar.config(text="Python: system")
+
+    def _apply_venv_to_subsystems(self):
+        """Apply the current venv state to all three bottom panels."""
+        venv_path = self.venv_manager.venv_path
+        site_packages = self.venv_manager.get_site_packages()
+        self._sys_term.set_venv(venv_path)
+        self._shell_panel.set_venv(site_packages)
+        self._pkg_panel.set_venv(venv_path)
 
     # ---- Tab event callbacks -----------------------------------------------
 
@@ -659,16 +837,23 @@ class MarkdownEditor:
         folder_path = filedialog.askdirectory(title="Open Folder", initialdir=os.path.expanduser('~'))
         if folder_path:
             self.current_folder = folder_path
+            self.venv_manager.set_folder(folder_path)
             self.populate_file_tree(folder_path)
-            self.terminal_panel.cd_to(folder_path)
+            self._sys_term.cd_to(folder_path)
             self.status_bar.config(text=f"Opened folder: {os.path.basename(folder_path)}")
             self._refresh_git_panel()
+            self._update_venv_status()
+            if self.venv_manager.is_active:
+                self._apply_venv_to_subsystems()
 
     def close_folder(self):
         """Close the currently opened folder, clear file tree and git panel."""
         self.current_folder = None
+        self.venv_manager.set_folder(None)
         self.file_tree.delete(*self.file_tree.get_children())
         self._refresh_git_panel()
+        self._update_venv_status()
+        self._apply_venv_to_subsystems()
         self.status_bar.config(text="Folder closed")
 
     def populate_file_tree(self, folder_path):
@@ -1267,9 +1452,13 @@ class MarkdownEditor:
                     clone_dialog.destroy()
                     messagebox.showinfo("Success", "Repository cloned successfully", parent=self.root)
                     self.current_folder = dest
+                    self.venv_manager.set_folder(dest)
                     self.populate_file_tree(dest)
-                    self.terminal_panel.cd_to(dest)
+                    self._sys_term.cd_to(dest)
                     self.status_bar.config(text=f"Opened: {os.path.basename(dest)}")
+                    self._update_venv_status()
+                    if self.venv_manager.is_active:
+                        self._apply_venv_to_subsystems()
                     self._update_git_buttons()
                 else:
                     error_msg = result.stderr if result.stderr else result.stdout
