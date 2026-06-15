@@ -553,7 +553,7 @@ class MarkdownEditor:
             self.status_bar.config(text=f"Editing: {base}")
         else:
             self.status_bar.config(text="New file")
-        self.after(1, self._update_cursor_pos)
+        self.root.after(1, self._update_cursor_pos)
 
     def _update_cursor_pos(self):
         """Update the cursor position label in the status bar."""
