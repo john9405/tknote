@@ -310,7 +310,11 @@ class MarkdownEditor:
         self.status_bar = ttk.Label(
             status_frame, text="Ready", relief=tk.SUNKEN, anchor='w')
         self.status_bar.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
+        # Cursor position
+        self._cursor_pos = ttk.Label(
+            status_frame, text='Ln 1, Col 1', relief=tk.SUNKEN,
+            padding=(6, 1))
+        self._cursor_pos.pack(side=tk.LEFT)
         # Right (packed before terminal so it appears to its left):
         # Python environment indicator
         self._venv_status = ttk.Label(
@@ -367,6 +371,10 @@ class MarkdownEditor:
         editor.bind("<Button-2>", self.show_editor_context_menu)
         editor.bind("<Button-3>", self.show_editor_context_menu)
         editor.bind("<Control-Button-1>", self.show_editor_context_menu)
+
+        # Cursor position tracking
+        editor.bind('<KeyRelease>', lambda e: self._update_cursor_pos())
+        editor.bind('<ButtonRelease-1>', lambda e: self._update_cursor_pos())
 
     # ---- Bottom panels (Shell / Packages / Terminal) -----------------------
 
@@ -545,6 +553,19 @@ class MarkdownEditor:
             self.status_bar.config(text=f"Editing: {base}")
         else:
             self.status_bar.config(text="New file")
+        self.after(1, self._update_cursor_pos)
+
+    def _update_cursor_pos(self):
+        """Update the cursor position label in the status bar."""
+        editor = self.editor
+        if editor is None:
+            return
+        try:
+            pos = editor.index(tk.INSERT)
+            line, col = pos.split('.')
+            self._cursor_pos.config(text=f'Ln {line}, Col {int(col) + 1}')
+        except (tk.TclError, ValueError, AttributeError):
+            pass
 
     def _on_close_request(self, tab_id):
         """Called when the user clicks the close button on a tab."""
