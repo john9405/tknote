@@ -131,7 +131,7 @@ class PythonShell(ttk.Frame):
             side=tk.LEFT, padx=(4, 0), pady=(2, 0))
 
         close_btn = ttk.Button(
-            header, text='×', width=2, command=self._on_close)
+            header, text='×', width=1, command=self._on_close)
         close_btn.pack(side=tk.RIGHT, padx=(0, 4), pady=(2, 0))
 
         # Separator

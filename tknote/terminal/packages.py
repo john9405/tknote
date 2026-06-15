@@ -67,7 +67,7 @@ class PackageManager(ttk.Frame):
 
         # Close button
         close_btn = ttk.Button(
-            toolbar, text='×', width=2, command=self._on_close)
+            toolbar, text='×', width=1, command=self._on_close)
         close_btn.pack(side=tk.RIGHT, padx=(4, 0))
 
         # ── Treeview ──

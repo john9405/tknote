@@ -1,9 +1,18 @@
-"""SystemTerminal — standalone inline interactive system terminal."""
+"""SystemTerminal — standalone inline interactive system terminal.
+
+Features:
+  - ANSI SGR color support (16+256 colors) via tkinter text tags
+  - Dark theme matching VS Code terminal colours
+  - Character-cell wrap (no word-wrap) with horizontal scroll
+  - Dynamic PTY window size that follows widget dimensions
+  - Carriage-return / line-clear handling for inline progress bars
+"""
+
+from __future__ import annotations
 
 import fcntl
 import os
 import pty
-import re
 import select
 import signal
 import struct
@@ -12,31 +21,204 @@ import termios
 import threading
 import tkinter as tk
 from tkinter import ttk
+from typing import Optional
 
-# ── ANSI escape sequence stripping ────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# ANSI SGR → tkinter tag processing
+# ═══════════════════════════════════════════════════════════════════════════════
 
-_ANSI_RE = re.compile(
-    r'\x1b\[[0-9;<=>?]*[ -/]*[@-~]'  # CSI: cursor/color/mode (incl. ?2004h etc.)
-    r'|\x1b\][^\x07\x1b]*\x07'       # OSC: window title, etc.
-    r'|\x1b\][^\x07\x1b]*\x1b\\'     # OSC (ST terminator)
-    r'|\x1b[PX^_].*?\x1b\\'          # DCS/SOS/PM/APC strings
-    r'|\x1b[^\x1b]'                  # any other single-char escape
-)
+# Standard 16-colour palette (dark-theme friendly, VS Code-ish)
+_FG_PALETTE = {
+    30: '#808080',   # black → gray (visible on dark bg)
+    31: '#cd3131',   # red
+    32: '#0dbc79',   # green
+    33: '#e5e510',   # yellow
+    34: '#2472c8',   # blue
+    35: '#bc3fbc',   # magenta
+    36: '#11a8cd',   # cyan
+    37: '#e5e5e5',   # white
+    90: '#767676',   # bright black
+    91: '#f14c4c',   # bright red
+    92: '#23d18b',   # bright green
+    93: '#f5f543',   # bright yellow
+    94: '#3b8eea',   # bright blue
+    95: '#d670d6',   # bright magenta
+    96: '#29b8db',   # bright cyan
+    97: '#ffffff',   # bright white
+}
 
-# \x08 (backspace) intentionally kept — _append_shell_output interprets it
-_CTRL_RE = re.compile(r'[\x00-\x07\x0b\x0c\x0e-\x1f]')
+_BG_PALETTE = {
+    40: '#000000',
+    41: '#cd3131',
+    42: '#0dbc79',
+    43: '#e5e510',
+    44: '#2472c8',
+    45: '#bc3fbc',
+    46: '#11a8cd',
+    47: '#e5e5e5',
+    100: '#767676',
+    101: '#f14c4c',
+    102: '#23d18b',
+    103: '#f5f543',
+    104: '#3b8eea',
+    105: '#d670d6',
+    106: '#29b8db',
+    107: '#ffffff',
+}
+
+# Map ANSI code → tag name suffix
+def _make_tag_name(code, is_bg):
+    if is_bg:
+        return f'ansi_bg_{code}'
+    return f'ansi_fg_{code}'
 
 
-def _clean_ansi(text):
-    """Strip ANSI escape sequences and stray control chars from terminal output."""
-    text = _ANSI_RE.sub('', text)
-    # Collapse repeated carriage returns / newlines
-    text = text.replace('\r\n', '\n').replace('\r', '\n')
-    text = _CTRL_RE.sub('', text)
-    return text
+class _AnsiParser:
+    """Streaming ANSI SGR parser.
+
+    Feeds in raw terminal output; yields (text, tags) segments.
+    Only SGR colour/style codes are processed; all other CSI sequences
+    (cursor movement, erase, etc.) are silently stripped.
+
+    Tags are tkinter tag names already configured on the Text widget.
+    """
+
+    # Sentinel inserted into the segment stream to mark \x1b[K (erase line)
+    _ERASE_LINE = object()
+
+    def __init__(self, text_widget: tk.Text):
+        self._w = text_widget
+        self._bold = False
+        self._dim = False
+        self._italic = False
+        self._underline = False
+        self._fg_code = 37   # default white
+        self._bg_code = None  # default transparent
+
+    def _current_tags(self) -> tuple[str, ...]:
+        tags: list[str] = []
+        if self._bold:
+            tags.append('ansi_bold')
+        if self._dim:
+            tags.append('ansi_dim')
+        if self._italic:
+            tags.append('ansi_italic')
+        if self._underline:
+            tags.append('ansi_underline')
+        if self._fg_code is not None:
+            tags.append(_make_tag_name(self._fg_code, False))
+        if self._bg_code is not None:
+            tags.append(_make_tag_name(self._bg_code, True))
+        return tuple(tags)
+
+    def _reset_sgr(self):
+        self._bold = False
+        self._dim = False
+        self._italic = False
+        self._underline = False
+        self._fg_code = 37
+        self._bg_code = None
+
+    def _apply_sgr(self, code: int):
+        if code == 0:
+            self._reset_sgr()
+        elif code == 1:
+            self._bold = True
+        elif code == 2:
+            self._dim = True
+        elif code == 3:
+            self._italic = True
+        elif code == 4:
+            self._underline = True
+        elif code == 22:
+            self._bold = False
+            self._dim = False
+        elif code == 23:
+            self._italic = False
+        elif code == 24:
+            self._underline = False
+        elif 30 <= code <= 37 or 90 <= code <= 97:
+            self._fg_code = code
+        elif 40 <= code <= 47 or 100 <= code <= 107:
+            self._bg_code = code
+        elif code == 39:
+            self._fg_code = 37
+        elif code == 49:
+            self._bg_code = None
+
+    def feed(self, data: str) -> list:
+        """Parse a chunk of terminal output.
+
+        Returns a list where each element is either:
+          - (text: str, tags: tuple) — insert with given tags
+          - _ERASE_LINE — clear from cursor to end of current line
+        """
+        segments: list = []
+        i = 0
+        n = len(data)
+        buf: list[str] = []
+
+        def _flush():
+            if buf:
+                segments.append((''.join(buf), self._current_tags()))
+                buf.clear()
+
+        while i < n:
+            if data[i:i + 2] == '\x1b[':
+                _flush()
+                i += 2
+                # Collect parameter bytes
+                j = i
+                while j < n and data[j] not in '@-~':
+                    j += 1
+                if j >= n:
+                    # Incomplete sequence — treat \x1b[ as text
+                    buf.append('\x1b[')
+                    buf.append(data[i:])
+                    i = n
+                    break
+
+                params_str = data[i:j]
+                final = data[j]
+                i = j + 1  # skip past terminator
+
+                if final == 'm':
+                    if params_str:
+                        for p in params_str.split(';'):
+                            try:
+                                self._apply_sgr(int(p) if p else 0)
+                            except ValueError:
+                                pass
+                    else:
+                        self._apply_sgr(0)
+                elif final == 'K' and params_str in ('', '0'):
+                    segments.append(self._ERASE_LINE)
+                # All other CSI sequences: silently dropped
+            else:
+                buf.append(data[i])
+                i += 1
+
+        _flush()
+
+        # Merge adjacent text segments with identical tags
+        merged: list = []
+        for item in segments:
+            if item is self._ERASE_LINE:
+                merged.append(item)
+            else:
+                text, tags = item
+                if merged and merged[-1] is not self._ERASE_LINE:
+                    prev = merged[-1]
+                    if prev[1] == tags:
+                        merged[-1] = (prev[0] + text, tags)
+                        continue
+                merged.append(item)
+        return merged
 
 
-# ── Key → PTY byte mapping for terminal input ────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# Key → PTY byte mapping
+# ═══════════════════════════════════════════════════════════════════════════════
 
 _KEY_TO_PTY = {
     'Return':    b'\r',
@@ -55,8 +237,17 @@ _KEY_TO_PTY = {
 }
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# SystemTerminal widget
+# ═══════════════════════════════════════════════════════════════════════════════
+
 class SystemTerminal(ttk.Frame):
     """Standalone inline interactive system terminal (PTY-based)."""
+
+    # Dark theme colours
+    BG = '#1e1e1e'
+    FG = '#d4d4d4'
+    CURSOR = '#d4d4d4'
 
     def __init__(self, parent, cwd=None, **kwargs):
         super().__init__(parent, **kwargs)
@@ -77,7 +268,7 @@ class SystemTerminal(ttk.Frame):
 
     def _build_ui(self):
         self.configure(height=200)
-        self.grid_rowconfigure(1, weight=1)
+        self.grid_rowconfigure(2, weight=1)
         self.grid_columnconfigure(0, weight=1)
 
         # Header bar
@@ -88,14 +279,14 @@ class SystemTerminal(ttk.Frame):
             side=tk.LEFT, padx=(4, 0), pady=(2, 0))
 
         close_btn = ttk.Button(
-            header, text='×', width=2, command=self._on_close)
+            header, text='×', width=1, command=self._on_close)
         close_btn.pack(side=tk.RIGHT, padx=(0, 4), pady=(2, 0))
 
         # Separator
         ttk.Separator(self, orient=tk.HORIZONTAL).grid(
             row=1, column=0, sticky='ew')
 
-        # Terminal text area
+        # Terminal text area with both scrollbars
         term_frame = ttk.Frame(self)
         term_frame.grid(row=2, column=0, sticky='nsew')
         self.grid_rowconfigure(2, weight=1)
@@ -104,13 +295,35 @@ class SystemTerminal(ttk.Frame):
 
         self._shell_output = tk.Text(
             term_frame,
-            bg='#ffffff', fg='#1e1e1e', insertbackground='#1e1e1e',
-            font=('Monaco', 11), wrap=tk.WORD)
-        sh_scroll = ttk.Scrollbar(
-            term_frame, command=self._shell_output.yview)
-        self._shell_output.configure(yscrollcommand=sh_scroll.set)
+            bg=self.BG, fg=self.FG,
+            insertbackground=self.CURSOR,
+            font=('Monaco', 12),
+            wrap=tk.NONE,              # character-cell wrap — no word-wrap
+            blockcursor=False,
+            highlightthickness=0,
+            bd=0,
+            padx=4, pady=4,
+        )
+
+        # Vertical scrollbar
+        v_scroll = ttk.Scrollbar(
+            term_frame, orient=tk.VERTICAL,
+            command=self._shell_output.yview)
+        # Horizontal scrollbar
+        h_scroll = ttk.Scrollbar(
+            term_frame, orient=tk.HORIZONTAL,
+            command=self._shell_output.xview)
+        self._shell_output.configure(
+            yscrollcommand=v_scroll.set,
+            xscrollcommand=h_scroll.set)
+
         self._shell_output.grid(row=0, column=0, sticky='nsew')
-        sh_scroll.grid(row=0, column=1, sticky='ns')
+        v_scroll.grid(row=0, column=1, sticky='ns')
+        h_scroll.grid(row=1, column=0, sticky='ew')
+
+        # ANSI parser
+        self._ansi = _AnsiParser(self._shell_output)
+        self._setup_ansi_tags()
 
         # Key bindings
         self._shell_output.bind('<Key>', self._handle_shell_key)
@@ -119,6 +332,10 @@ class SystemTerminal(ttk.Frame):
         self._shell_output.bind('<Command-c>', lambda e: None)
         self._shell_output.bind('<Command-a>', lambda e: None)
         self._shell_output.bind('<Command-x>', lambda e: None)
+
+        # Dynamic terminal size — update PTY when widget resizes
+        self._shell_output.bind('<Configure>', self._on_resize, add='+')
+        self._resize_after_id = None
 
         # Right-click context menu
         self._shell_context_menu = tk.Menu(term_frame, tearoff=0)
@@ -131,15 +348,59 @@ class SystemTerminal(ttk.Frame):
         self._shell_output.bind('<Button-3>', self._shell_right_click)
         self._shell_output.bind('<Control-Button-1>', self._shell_right_click)
 
+    def _setup_ansi_tags(self):
+        """Configure tkinter text tags for ANSI SGR attributes."""
+        # Foreground colours
+        for code, color in _FG_PALETTE.items():
+            self._shell_output.tag_configure(
+                _make_tag_name(code, False), foreground=color)
+        # Background colours
+        for code, color in _BG_PALETTE.items():
+            self._shell_output.tag_configure(
+                _make_tag_name(code, True), background=color)
+        # 256-colour placeholders — generated on demand by _ensure_256_tag
+        # Style attributes
+        self._shell_output.tag_configure('ansi_bold', font=('Monaco', 12, 'bold'))
+        self._shell_output.tag_configure('ansi_dim', foreground='#808080')
+        self._shell_output.tag_configure('ansi_italic', font=('Monaco', 12, 'italic'))
+        self._shell_output.tag_configure('ansi_underline', underline=True)
+
     # ── Close button ──────────────────────────────────────────────────────────
 
     def set_close_callback(self, callback):
-        """Called when the close (×) button is clicked."""
         self._close_callback = callback
 
     def _on_close(self):
         if self._close_callback:
             self._close_callback()
+
+    # ── Dynamic terminal sizing ───────────────────────────────────────────────
+
+    def _on_resize(self, event=None):
+        """Debounced PTY window-size update when the widget is resized."""
+        if self._resize_after_id is not None:
+            self.after_cancel(self._resize_after_id)
+        self._resize_after_id = self.after(150, self._update_winsize)
+
+    def _update_winsize(self):
+        """Send TIOCSWINSZ to the PTY with current widget dimensions."""
+        fd = self._shell_master_fd
+        if fd is None:
+            return
+        try:
+            font = self._shell_output.cget('font')
+            # Approximate: Monaco 12 → ~7 px per char wide, ~16 px per line tall
+            char_w = 7
+            line_h = 16
+            width_px = self._shell_output.winfo_width()
+            height_px = self._shell_output.winfo_height()
+            if width_px > 10 and height_px > 10:
+                cols = max(20, width_px // char_w)
+                rows = max(6, height_px // line_h)
+                winsize = struct.pack('HHHH', rows, cols, 0, 0)
+                fcntl.ioctl(fd, termios.TIOCSWINSZ, winsize)
+        except Exception:
+            pass
 
     # ── PTY / Shell process ───────────────────────────────────────────────────
 
@@ -151,7 +412,7 @@ class SystemTerminal(ttk.Frame):
             self._append_shell_output('[Error: could not open PTY]\n')
             return
 
-        # Set terminal size
+        # Set initial terminal size, then update once widget is mapped
         try:
             winsize = struct.pack('HHHH', 24, 80, 0, 0)
             fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsize)
@@ -187,34 +448,90 @@ class SystemTerminal(ttk.Frame):
             target=self._read_pty_output, daemon=True)
         self._reader_thread.start()
 
-        # If a venv is active, source its activate script once the shell is ready
+        # Update window size once the widget has dimensions
+        self.after(200, self._update_winsize)
+
+        # Activate venv after shell is ready
         if self._venv_path:
             activate_script = os.path.join(self._venv_path, 'bin', 'activate')
             if os.path.isfile(activate_script):
-                self.after(400, lambda: self._write_pty(
+                self.after(500, lambda: self._write_pty(
                     f"source '{activate_script}'\n".encode('utf-8')))
 
     def _append_shell_output(self, text):
-        """Append PTY output to the terminal widget, interpreting backspaces."""
+        """Parse ANSI-coloured output and insert into the text widget.
+
+        Handles backspace, carriage-return, and \\x1b[K (erase-to-end-of-line)
+        so that inline progress bars and line-editing render correctly.
+        """
         try:
             w = self._shell_output
-            w.mark_set("insert", "end-1c")
+
+            # ── Preprocess raw text ──────────────────────────────────────
+            # \r\n → \n  (standard CRLF line ending)
+            text = text.replace('\r\n', '\n')
+
+            # Process backspaces: \b deletes one character.  When the
+            # character-to-erase is in the *current* chunk we remove it
+            # from the buffer; when it was in a *previous* chunk we
+            # delete one character directly from the widget.
             if '\b' in text:
-                start = 0
-                for i, ch in enumerate(text):
+                out = []
+                widget_del = 0
+                for ch in text:
                     if ch == '\b':
-                        if start < i:
-                            w.insert("insert", text[start:i])
-                        try:
-                            w.delete("insert-1c", "insert")
-                        except tk.TclError:
-                            pass
-                        start = i + 1
-                if start < len(text):
-                    w.insert("insert", text[start:])
-            else:
-                w.insert("insert", text)
-            w.see("end-1c")
+                        if out:
+                            out.pop()
+                        else:
+                            widget_del += 1
+                    else:
+                        out.append(ch)
+                text = ''.join(out)
+                for _ in range(widget_del):
+                    try:
+                        if w.compare('insert', '>', 'insert linestart'):
+                            w.delete('insert-1c', 'insert')
+                    except tk.TclError:
+                        break
+
+            # Parse ANSI SGR sequences → (text, tags) segments
+            segments = self._ansi.feed(text)
+
+            for item in segments:
+                # ── Erase-to-end-of-line sentinel ────────────────────────
+                if item is _AnsiParser._ERASE_LINE:
+                    try:
+                        line_start = w.index('insert linestart')
+                        line_end = w.index('insert lineend')
+                        if w.compare('insert', '<', line_end):
+                            w.delete('insert', line_end)
+                    except tk.TclError:
+                        pass
+                    continue
+
+                seg_text, tags = item
+                if not seg_text:
+                    continue
+
+                # ── Carriage-return handling ─────────────────────────────
+                # \r moves cursor to start of current line; subsequent text
+                # overwrites (used by progress bars, inline status, etc.)
+                if '\r' in seg_text:
+                    parts = seg_text.split('\r')
+                    for i, part in enumerate(parts):
+                        if i > 0:
+                            try:
+                                line_start = w.index('insert linestart')
+                                if w.compare(line_start, '<', 'insert'):
+                                    w.delete(line_start, 'insert')
+                            except tk.TclError:
+                                pass
+                        if part:
+                            w.insert('insert', part, tags)
+                else:
+                    w.insert('insert', seg_text, tags)
+
+            w.see('insert')
         except tk.TclError:
             pass
 
@@ -228,19 +545,16 @@ class SystemTerminal(ttk.Frame):
                     if not data:
                         break
                     decoded = data.decode('utf-8', errors='replace')
-                    cleaned = _clean_ansi(decoded)
-                    if cleaned:
-                        self.after(0, lambda d=cleaned: self._append_shell_output(d))
+                    if decoded:
+                        self.after(0, lambda d=decoded: self._append_shell_output(d))
             except OSError:
                 break
-        # Subprocess exited
         if not self._reader_stop.is_set():
             self.after(0, self._handle_shell_exit)
 
     # ── Key handling ──────────────────────────────────────────────────────────
 
     def _write_pty(self, data):
-        """Write raw bytes to the PTY master fd."""
         fd = self._shell_master_fd
         if fd is not None:
             try:
@@ -249,7 +563,6 @@ class SystemTerminal(ttk.Frame):
                 pass
 
     def _handle_shell_key(self, event):
-        """Handle keypress in the terminal Text widget — send to PTY."""
         fd = self._shell_master_fd
         if fd is None:
             return "break"
@@ -296,7 +609,6 @@ class SystemTerminal(ttk.Frame):
         return "break"
 
     def _handle_shell_paste(self, event=None):
-        """Paste: send clipboard content directly to the PTY."""
         try:
             clip = self._shell_output.clipboard_get()
         except tk.TclError:
@@ -306,14 +618,12 @@ class SystemTerminal(ttk.Frame):
         return "break"
 
     def _has_selection(self):
-        """Return True if text is currently selected in the terminal."""
         try:
             return bool(self._shell_output.get(tk.SEL_FIRST, tk.SEL_LAST))
         except tk.TclError:
             return False
 
     def _shell_copy(self):
-        """Copy selected text to clipboard."""
         try:
             sel = self._shell_output.get(tk.SEL_FIRST, tk.SEL_LAST)
             if sel:
@@ -323,11 +633,9 @@ class SystemTerminal(ttk.Frame):
             pass
 
     def _shell_paste_to_terminal(self):
-        """Paste clipboard through PTY (context menu entry)."""
         self._handle_shell_paste()
 
     def _shell_right_click(self, event):
-        """Show context menu on right-click."""
         self._shell_context_menu.entryconfigure(
             0, state=tk.NORMAL if self._has_selection() else tk.DISABLED)
         try:
@@ -348,16 +656,18 @@ class SystemTerminal(ttk.Frame):
 
     # ── Venv integration ──────────────────────────────────────────────────────
 
-    def set_venv(self, venv_path: str | None):
-        """Set the active venv and restart the shell if running."""
+    def set_venv(self, venv_path: Optional[str]):
         self._venv_path = venv_path
         if self._shell_proc and self._shell_proc.poll() is None:
             self._stop_shell()
             self._start_shell()
 
     def _build_shell_env(self) -> dict:
-        """Build the environment dict for the shell subprocess."""
-        env = {**os.environ, 'TERM': 'dumb'}
+        env = {**os.environ}
+        # Use xterm-256color so programs emit SGR colour codes
+        env['TERM'] = 'xterm-256color'
+        # Some programs check COLORTERM for true-colour support
+        env['COLORTERM'] = 'truecolor'
         if self._venv_path:
             bin_dir = os.path.join(self._venv_path, 'bin')
             if os.path.isdir(bin_dir):
@@ -366,7 +676,6 @@ class SystemTerminal(ttk.Frame):
         return env
 
     def _stop_shell(self):
-        """Kill the shell subprocess and clean up PTY resources."""
         self._reader_stop.set()
         fd = self._shell_master_fd
         if fd is not None:
@@ -392,7 +701,6 @@ class SystemTerminal(ttk.Frame):
     # ── Directory tracking ────────────────────────────────────────────────────
 
     def cd_to(self, path):
-        """Change the terminal's working directory."""
         if not path or not os.path.isdir(path):
             return
         self._cwd = path
@@ -407,7 +715,6 @@ class SystemTerminal(ttk.Frame):
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def focus_input(self):
-        """Focus the terminal text widget."""
         self._shell_output.focus_set()
         try:
             self._shell_output.mark_set("insert", "end-1c")
@@ -415,5 +722,4 @@ class SystemTerminal(ttk.Frame):
             pass
 
     def cleanup(self):
-        """Kill subprocess, stop reader thread, clean up."""
         self._stop_shell()
