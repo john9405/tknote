@@ -3,6 +3,7 @@
 import bdb
 import code
 import os
+import subprocess
 import sys
 import tkinter as tk
 from tkinter import ttk
@@ -240,25 +241,31 @@ class PythonShell(ttk.Frame):
 
     def showprompt(self):
         """Write the '>>> ' prompt after iomark (caller must reset first)."""
-        # Add console tag to the newline before prompt
-        self._text.tag_add("console", "iomark-1c")
+        try:
+            # Add console tag to the newline before prompt
+            self._text.tag_add("console", "iomark-1c")
 
-        # Write the prompt with console tag
-        self._text.mark_gravity("iomark", "right")
-        self._text.insert("iomark", ">>> ", "console")
-        self._text.mark_gravity("iomark", "left")
-        self._text.see("end-1c")
+            # Write the prompt with console tag
+            self._text.mark_gravity("iomark", "right")
+            self._text.insert("iomark", ">>> ", "console")
+            self._text.mark_gravity("iomark", "left")
+            self._text.see("end-1c")
 
-        self._text.mark_set("insert", "end-1c")
+            self._text.mark_set("insert", "end-1c")
+        except tk.TclError:
+            pass
 
     def resetoutput(self):
         """Save current input to history, insert final newline, move iomark."""
-        source = self._text.get("iomark", "end-1c")
-        if self._history:
-            self._history.store(source)
-        if self._text.get("end-2c") != "\n":
-            self._text.insert("end-1c", "\n")
-        self._text.mark_set("iomark", "end-1c")
+        try:
+            source = self._text.get("iomark", "end-1c")
+            if self._history:
+                self._history.store(source)
+            if self._text.get("end-2c") != "\n":
+                self._text.insert("end-1c", "\n")
+            self._text.mark_set("iomark", "end-1c")
+        except tk.TclError:
+            pass
 
     # ── Write output ──────────────────────────────────────────────────────
 
@@ -486,6 +493,135 @@ class PythonShell(ttk.Frame):
             self._color.close()
             self._percolator.close()
         except Exception:
+            pass
+
+    def run_code(self, source, file_path=None):
+        """Execute Python source — IDLE Run Module style.
+
+        When *file_path* is provided and the file exists on disk, the
+        script is launched as a subprocess (so GUI apps have their own
+        event loop and closing the window triggers completion naturally).
+
+        Otherwise falls back to in-process ``exec()`` (e.g. unsaved buffers).
+
+        Parameters
+        ----------
+        source : str
+            The Python source code (used for in-process fallback only).
+        file_path : str, optional
+            If provided and exists on disk, launched via subprocess.
+        """
+        if file_path and os.path.isfile(file_path):
+            self._run_subprocess(file_path)
+        else:
+            self._run_inprocess(source, file_path)
+
+    def _run_subprocess(self, file_path):
+        """Launch *file_path* in a subprocess and capture output."""
+        self.restart(file_path)
+
+        label = os.path.basename(file_path)
+        self.write(f'── Running {label} ──\n', 'console')
+
+        try:
+            result = subprocess.run(
+                [sys.executable, '-u', file_path],
+                capture_output=True,
+                text=True,
+                cwd=os.path.dirname(file_path),
+            )
+        except FileNotFoundError:
+            self.write('[Error: Python interpreter not found]\n', 'stderr')
+            self._emit_completion()
+            return
+
+        if result.stdout:
+            self.write(result.stdout, 'stdout')
+        if result.stderr:
+            self.write(result.stderr, 'stderr')
+
+        self._emit_completion()
+
+    def _run_inprocess(self, source, file_path):
+        """Fallback: run source in-process via exec()."""
+        self.restart(file_path)
+
+        label = os.path.basename(file_path) if file_path else '<script>'
+        self.write(f'── Running {label} ──\n', 'console')
+
+        old_stdout = sys.stdout
+        old_stderr = sys.stderr
+        sys.stdout = _ShellWriter(self, 'stdout')
+        sys.stderr = _ShellWriter(self, 'stderr')
+        try:
+            filename = file_path or '<script>'
+            compiled = compile(source, filename, 'exec')
+            exec(compiled, {'__name__': '__main__'})
+        except SystemExit:
+            pass
+        except Exception:
+            import traceback
+            traceback.print_exc()
+        finally:
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
+
+        self._emit_completion()
+
+    # ── Shell restart (IDLE-style) ─────────────────────────────────────────
+
+    def restart(self, file_path=None):
+        """Restart the Python interpreter — clear all state.
+
+        This mimics IDLE's Shell restart: saves history, resets locals,
+        clears the console, and prints a restart banner.
+
+        Parameters
+        ----------
+        file_path : str, optional
+            If provided, shown in the restart banner and its parent
+            directory is added to sys.path.
+        """
+        # Reset output area
+        self.resetoutput()
+
+        # Save history before clearing state
+        if self._history:
+            try:
+                self._history.store(self._text.get("iomark", "end-1c"))
+            except tk.TclError:
+                pass
+
+        # Clear locals and recreate console
+        self._locals.clear()
+        self._console = code.InteractiveConsole(locals=self._locals)
+
+        # Add file directory to sys.path (for imports)
+        if file_path:
+            dir_name = os.path.dirname(os.path.abspath(file_path))
+            if dir_name not in sys.path:
+                sys.path.insert(0, dir_name)
+
+        # Print IDLE-style restart banner
+        banner = '=' * 20 + ' RESTART: '
+        if file_path:
+            banner += file_path
+        else:
+            banner += 'Shell'
+        banner += ' ' + '=' * 20
+        self.write(f'\n{banner}\n', 'console')
+
+    def _emit_completion(self):
+        """Signal that script execution has finished.
+
+        Writes a completion marker and shows a new prompt.  Silently
+        returns if the underlying Text widget has been destroyed.
+        """
+        try:
+            if self._text.winfo_exists():
+                self.write('── Finished ──\n', 'console')
+                self.showprompt()
+        except tk.TclError:
             pass
 
     @property

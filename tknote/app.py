@@ -70,6 +70,11 @@ class MarkdownEditor:
         edit_menu.add_command(label="Flash Parens", command=self.flash_paren, accelerator="Cmd+Shift+P")
         edit_menu.add_command(label="Keyword Hint", command=self.show_keyword_hint, accelerator="Cmd+Shift+K")
 
+        run_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Run", menu=run_menu)
+        run_menu.add_command(label="Run Module", command=self.run_current_file, accelerator="Cmd+R")
+        run_menu.add_command(label="Run in Terminal", command=self.run_in_terminal, accelerator="Cmd+Shift+R")
+
         view_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="View", menu=view_menu)
         view_menu.add_command(label="Toggle Terminal", command=self._toggle_terminal, accelerator="Cmd+J")
@@ -246,6 +251,8 @@ class MarkdownEditor:
         editor.bind("<Command-Shift-Z>", lambda _: self.redo())
         editor.bind("<Command-Shift-P>", lambda _: self.flash_paren())
         editor.bind("<Command-Shift-K>", lambda _: self.show_keyword_hint())
+        editor.bind("<Command-r>", lambda _: self.run_current_file())
+        editor.bind("<Command-Shift-R>", lambda _: self.run_in_terminal())
         editor.bind("<Button-2>", self.show_editor_context_menu)
         editor.bind("<Button-3>", self.show_editor_context_menu)
         editor.bind("<Control-Button-1>", self.show_editor_context_menu)
@@ -741,6 +748,83 @@ class MarkdownEditor:
             self.tabbed_editor.set_tab_path(tab['id'], file_path)
             return self._save_to_tab(tab)
         return False
+
+    # ---- Run code ----------------------------------------------------------
+
+    def run_current_file(self):
+        """Run the current file in the Python shell (IDLE Run Module style).
+
+        Restarts the shell, saves the file, and executes with
+        ``__name__ == '__main__'``.
+        """
+        tab = self.tabbed_editor.get_active_tab()
+        if not tab:
+            self.status_bar.config(text="No file to run")
+            return
+
+        # IDLE-style: must save before running
+        if tab['file_path']:
+            if tab['editor'].is_modified():
+                self._save_to_tab(tab)
+            file_path = tab['file_path']
+        else:
+            # Unsaved file — force Save As first
+            if not self.save_file_as():
+                return
+            file_path = tab['file_path']
+
+        source = tab['editor'].get_text()
+
+        # Show the Python shell
+        if not self._shell_panel.winfo_ismapped():
+            self._toggle_shell()
+        try:
+            self.root.update_idletasks()
+        except tk.TclError:
+            pass
+
+        self._shell_panel.run_code(source, file_path=file_path)
+        try:
+            self.status_bar.config(text=f"Ran: {os.path.basename(file_path)}")
+        except tk.TclError:
+            pass  # widget may have been destroyed by user code
+
+    def run_in_terminal(self):
+        """Run the current file in the system terminal."""
+        tab = self.tabbed_editor.get_active_tab()
+        if not tab:
+            self.status_bar.config(text="No file to run")
+            return
+
+        # Save if there's a file path
+        if tab['file_path']:
+            if tab['editor'].is_modified():
+                self._save_to_tab(tab)
+
+            file_path = tab['file_path']
+            dir_name = os.path.dirname(file_path)
+            file_name = os.path.basename(file_path)
+
+            # Show the terminal
+            if not self._sys_term.winfo_ismapped():
+                self._toggle_terminal()
+            try:
+                self.root.update_idletasks()
+            except tk.TclError:
+                pass
+
+            # cd to directory and run
+            self._sys_term.cd_to(dir_name)
+            self._sys_term.send_command(f'python3 "{file_name}"')
+            try:
+                self.status_bar.config(text=f"Running in Terminal: {file_name}")
+            except tk.TclError:
+                pass
+        else:
+            # Unsaved file — save first
+            if not self.save_file_as():
+                return
+            self.run_in_terminal()
 
     # ---- Text formatting ---------------------------------------------------
 

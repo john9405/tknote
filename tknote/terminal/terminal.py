@@ -717,5 +717,14 @@ class SystemTerminal(ttk.Frame):
         except tk.TclError:
             pass
 
+    def send_command(self, cmd):
+        """Send a command string to the PTY (appends newline)."""
+        fd = self._shell_master_fd
+        if fd is not None and self._shell_proc and self._shell_proc.poll() is None:
+            try:
+                os.write(fd, (cmd + '\n').encode('utf-8'))
+            except OSError:
+                pass
+
     def cleanup(self):
         self._stop_shell()
