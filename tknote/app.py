@@ -2,7 +2,6 @@
 
 import os
 import re
-import subprocess
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
@@ -12,7 +11,8 @@ from .terminal.shell import PythonShell
 from .terminal.packages import PackageManager
 from .terminal.terminal import SystemTerminal
 from .venv_manager import VenvManager
-from .git_ops import run_git_command
+from .file_tree import FileTreePanel
+from .git_panel import GitPanel
 
 
 class MarkdownEditor:
@@ -25,10 +25,6 @@ class MarkdownEditor:
         self.venv_manager = VenvManager()
         self.setup_ui()
         self.root.protocol('WM_DELETE_WINDOW', self._on_window_close)
-
-    def _run_git(self, args):
-        """Run a git command in the currently opened folder."""
-        return run_git_command(args, cwd=self.current_folder)
 
     # ---- Editor property (delegates to active tab) ------------------------
 
@@ -118,150 +114,31 @@ class MarkdownEditor:
         self.editor_paned = editor_paned
 
         # -- File tree panel (inside primary sidebar) --
-        self.file_tree_frame = ttk.Frame(primary_sidebar_frame)
-
-        tree_header = ttk.Frame(self.file_tree_frame)
-        tree_header.pack(fill=tk.X)
-        ttk.Label(tree_header, text="Files", font=("Helvetica", 10, "bold")).pack(side=tk.LEFT, padx=(0, 5))
-
-        btn_frame = ttk.Frame(tree_header)
-        btn_frame.pack(side=tk.RIGHT)
-
-        new_btn = ttk.Button(btn_frame, text="+", width=1, command=self.show_new_menu)
-        new_btn.pack(side=tk.LEFT, padx=1)
-
-        refresh_btn = ttk.Button(btn_frame, text="⟳", width=1, command=self.refresh_file_tree)
-        refresh_btn.pack(side=tk.LEFT, padx=1)
-
-        tree_scroll = ttk.Scrollbar(self.file_tree_frame)
-        tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-
-        self.file_tree = ttk.Treeview(self.file_tree_frame, yscrollcommand=tree_scroll.set, selectmode="browse")
-        self.file_tree.pack(fill=tk.BOTH, expand=True)
-        tree_scroll.config(command=self.file_tree.yview)
-        self.file_tree.bind("<Double-1>", self.on_tree_double_click)
-        self.file_tree.bind("<Button-2>", self.show_context_menu)
-        self.file_tree.bind("<Button-3>", self.show_context_menu)
-        self.file_tree.bind("<Control-Button-1>", self.show_context_menu)
-
-        # File tree context menu
-        self.context_menu = tk.Menu(self.root, tearoff=0)
-        self.context_menu.add_command(label="New File", command=self.new_file_in_tree)
-        self.context_menu.add_command(label="New Folder", command=self.new_folder_in_tree)
-        self.context_menu.add_separator()
-        self.context_menu.add_command(label="Rename", command=self.rename_selected)
-        self.context_menu.add_command(label="Move", command=self.move_selected)
-        self.context_menu.add_separator()
-        self.context_menu.add_command(label="Delete", command=self.delete_selected)
+        self.file_tree = FileTreePanel(primary_sidebar_frame, callbacks={
+            'get_current_folder': lambda: self.current_folder,
+            'set_current_folder': lambda v: setattr(self, 'current_folder', v),
+            'open_file_in_tab': self._open_file_in_tab,
+            'set_status': lambda msg: self.status_bar.config(text=msg),
+            'file_deleted': self._on_file_deleted,
+            'file_path_changed': self._on_file_path_changed,
+            'new_file_requested': self.new_file,
+        })
 
         # -- Git panel (inside auxiliary sidebar) --
-        self.git_panel_frame = ttk.Frame(auxiliary_sidebar_frame)
-
-        git_header = ttk.Frame(self.git_panel_frame)
-        git_header.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Label(git_header, text="Source Control", font=("Helvetica", 10, "bold")).pack(side=tk.LEFT)
-
-        git_header_actions = ttk.Frame(git_header)
-        git_header_actions.pack(side=tk.RIGHT)
-
-        self._status_branch_label = ttk.Label(
-            git_header_actions, text="⎇ no repo", font=("Helvetica", 10))
-        self._status_branch_label.pack(side=tk.LEFT, padx=(0, 6))
-        self._status_branch_label.bind('<Button-1>', self._show_branch_popup)
-
-        self._status_push_btn = ttk.Button(
-            git_header_actions, text="↑", command=self.git_push, width=1,
-            state=tk.DISABLED)
-        self._status_push_btn.pack(side=tk.LEFT, padx=1)
-
-        self._status_pull_btn = ttk.Button(
-            git_header_actions, text="↓", command=self.git_pull, width=1,
-            state=tk.DISABLED)
-        self._status_pull_btn.pack(side=tk.LEFT, padx=1)
-
-        # ---- Top buttons: repository setup (conditional) + commit area ----
-        git_btn_frame = ttk.Frame(self.git_panel_frame)
-        git_btn_frame.pack(fill=tk.X, padx=5, pady=5)
-        # Store button references for show/hide control
-        self._git_btns = {}
-
-        # Row 0: repository setup
-        self._git_btns['clone'] = ttk.Button(git_btn_frame, text="Clone", command=self.git_clone)
-        self._git_btns['clone'].grid(row=0, column=0, columnspan=2, padx=1, pady=1, sticky='ew')
-        self._git_btns['init'] = ttk.Button(git_btn_frame, text="Init", command=self.git_init)
-        self._git_btns['init'].grid(row=0, column=1, columnspan=2, padx=1, pady=1, sticky='ew')
-
-        # Row 1: remote setup
-        self._git_btns['remote'] = ttk.Button(git_btn_frame, text="Remote", command=self.git_set_remote)
-        self._git_btns['remote'].grid(row=1, column=0, columnspan=2, padx=1, pady=1, sticky='ew')
-
-        # Row 2: commit message entry
-        self._commit_msg_var = tk.StringVar()
-        self._commit_msg_entry = ttk.Entry(git_btn_frame, textvariable=self._commit_msg_var)
-        self._commit_msg_entry.grid(row=2, column=0, columnspan=2, padx=1, pady=(4, 1), sticky='ew')
-        self._commit_msg_entry.insert(0, "Enter commit message...")
-        self._commit_msg_entry.bind('<FocusIn>', self._on_commit_msg_focus_in)
-        self._commit_msg_entry.bind('<FocusOut>', self._on_commit_msg_focus_out)
-
-        # Row 3: commit
-        self._git_btns['commit'] = ttk.Button(git_btn_frame, text="Commit", command=self.git_commit)
-        self._git_btns['commit'].grid(row=3, column=0, columnspan=2, padx=1, pady=1, sticky='ew')
-
-        git_btn_frame.columnconfigure(0, weight=1)
-        git_btn_frame.columnconfigure(1, weight=1)
-        self._update_git_buttons()
-
-        # ---- Changed files list ----
-        ttk.Label(self.git_panel_frame, text="Changed Files",
-                  font=("Helvetica", 10, "bold")).pack(anchor="w", padx=5, pady=(5, 0))
-
-        git_status_frame = ttk.Frame(self.git_panel_frame)
-        git_status_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-
-        git_status_scroll = ttk.Scrollbar(git_status_frame)
-        git_status_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-
-        self.git_status_text = tk.Text(
-            git_status_frame, width=36, height=8, font=("Monaco", 10),
-            yscrollcommand=git_status_scroll.set, state=tk.DISABLED,
-            cursor='hand2'
-        )
-        self.git_status_text.pack(fill=tk.BOTH, expand=True)
-        self.git_status_text.bind('<Double-Button-1>', self._on_git_status_double_click)
-        self.git_status_text.bind('<Button-2>', self._on_git_status_right_click)
-        self.git_status_text.bind('<Button-3>', self._on_git_status_right_click)
-        self.git_status_text.bind('<Control-Button-1>', self._on_git_status_right_click)
-        git_status_scroll.config(command=self.git_status_text.yview)
-
-        # Git status context menu (right-click on changed files)
-        self._git_context_menu = tk.Menu(self.root, tearoff=0)
-        self._git_context_menu.add_command(label="Rollback", command=self._git_rollback)
-        self._git_context_menu.add_command(label="Open File", command=self._git_open_selected)
-        self._git_context_menu.add_command(label="Show Diff", command=self._git_show_diff)
-        self._git_context_menu.add_separator()
-        self._git_context_menu.add_command(label="Refresh", command=self._refresh_git_panel)
-        self._git_right_clicked_file = None
-
-        # ---- Commit log ----
-        ttk.Label(self.git_panel_frame, text="Commit Log",
-                  font=("Helvetica", 10, "bold")).pack(anchor="w", padx=5, pady=(5, 0))
-
-        log_frame = ttk.Frame(self.git_panel_frame)
-        log_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-
-        log_scroll = ttk.Scrollbar(log_frame)
-        log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-
-        self._git_log_text = tk.Text(
-            log_frame, width=36, height=6, font=("Monaco", 10),
-            yscrollcommand=log_scroll.set, state=tk.DISABLED
-        )
-        self._git_log_text.pack(fill=tk.BOTH, expand=True)
-        log_scroll.config(command=self._git_log_text.yview)
+        self.git_panel = GitPanel(auxiliary_sidebar_frame, callbacks={
+            'get_current_folder': lambda: self.current_folder,
+            'set_status': lambda msg: self.status_bar.config(text=msg),
+            'open_file_in_tab': self._open_file_in_tab,
+            'refresh_file_tree': self.file_tree.refresh,
+            'folder_opened': self._on_git_folder_opened,
+            'reload_file': self._reload_file_in_tab,
+            'close_diff_tab': self._close_diff_tab,
+            'open_diff_tab': self._open_diff_tab,
+        })
 
         # Show sidebars by default
-        self.file_tree_frame.pack(fill=tk.BOTH, expand=True)
-        self.git_panel_frame.pack(fill=tk.BOTH, expand=True)
+        self.file_tree.pack(fill=tk.BOTH, expand=True)
+        self.git_panel.pack(fill=tk.BOTH, expand=True)
 
         # -- Tabbed editor --
         self.tabbed_editor = TabbedEditor(
@@ -346,7 +223,7 @@ class MarkdownEditor:
         self._pkg_status.bind('<Button-1>', lambda e: self._toggle_packages())
         # Update status bar widget references
         self._status_frame = status_frame
-        self._refresh_git_panel()
+        self.git_panel.refresh()
 
     # ---- Shortcut binding for new editors ----------------------------------
 
@@ -683,7 +560,7 @@ class MarkdownEditor:
             self.main_paned.add(self.auxiliary_sidebar_frame, weight=0)
             self._auxiliary_sidebar_visible = True
         self._git_panel_status.config(text='Source Control')
-        self._refresh_git_panel()
+        self.git_panel.refresh()
 
     def _hide_auxiliary_sidebar(self):
         """Hide the auxiliary sidebar."""
@@ -700,178 +577,6 @@ class MarkdownEditor:
         else:
             self._show_auxiliary_sidebar()
             self.status_bar.config(text="Source Control shown")
-
-    def _refresh_git_panel(self):
-        """Update the git panel with current branch, status, and log."""
-        if not self.current_folder:
-            self._status_branch_label.config(text="⎇ no repo", cursor='')
-            self._status_push_btn.config(state=tk.DISABLED)
-            self._status_pull_btn.config(state=tk.DISABLED)
-            self.git_status_text.config(state=tk.NORMAL)
-            self.git_status_text.delete(1.0, tk.END)
-            self.git_status_text.insert(tk.END, "Open a folder to see git status.")
-            self.git_status_text.config(state=tk.DISABLED)
-            self._git_log_text.config(state=tk.NORMAL)
-            self._git_log_text.delete(1.0, tk.END)
-            self._git_log_text.config(state=tk.DISABLED)
-            self._update_git_buttons()
-            return
-
-        has_git = os.path.isdir(os.path.join(self.current_folder, '.git'))
-        if not has_git:
-            self._status_branch_label.config(text="⎇ no repo", cursor='')
-            self._status_push_btn.config(state=tk.DISABLED)
-            self._status_pull_btn.config(state=tk.DISABLED)
-        else:
-            _, branch, _ = self._run_git(['branch', '--show-current'])
-            branch = branch.strip() if branch else 'unknown'
-            self._status_branch_label.config(text=f"⎇ {branch}", cursor='hand2')
-            self._status_push_btn.config(state=tk.NORMAL)
-            self._status_pull_btn.config(state=tk.NORMAL)
-
-        # Changed files
-        _, status, _ = self._run_git(['status', '--short'])
-        self.git_status_text.config(state=tk.NORMAL)
-        self.git_status_text.delete(1.0, tk.END)
-        if status.strip():
-            self.git_status_text.insert(tk.END, status)
-        else:
-            self.git_status_text.insert(tk.END, "Working tree clean")
-        self.git_status_text.config(state=tk.DISABLED)
-
-        # Commit log
-        self._refresh_commit_log()
-        self._update_git_buttons()
-
-    def _parse_git_status_line(self, event):
-        """Extract (rel_path, file_path) from a click on the git status text."""
-        if not self.current_folder:
-            return None, None
-        idx = self.git_status_text.index(f'@{event.x},{event.y}')
-        line_text = self.git_status_text.get(f'{idx} linestart', f'{idx} lineend')
-        if not line_text.strip() or len(line_text) <= 3 or '->' in line_text:
-            return None, None
-        rel_path = line_text[3:].strip()
-        return rel_path, os.path.join(self.current_folder, rel_path)
-
-    def _on_git_status_double_click(self, event):
-        """Show git diff for a file double-clicked in the git status panel."""
-        rel_path, file_path = self._parse_git_status_line(event)
-        if rel_path is None:
-            return
-        self._show_diff_for(rel_path)
-
-    def _on_git_status_right_click(self, event):
-        """Show context menu on right-click in git status panel."""
-        rel_path, file_path = self._parse_git_status_line(event)
-        self._git_right_clicked_file = (rel_path, file_path)
-        try:
-            self._git_context_menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            self._git_context_menu.grab_release()
-
-    def _git_rollback(self):
-        """Discard changes to the selected file (git checkout -- <file>)."""
-        info = self._git_right_clicked_file
-        if not info or not info[0] or not info[1]:
-            return
-        rel_path, file_path = info
-        name = os.path.basename(rel_path)
-        confirm = messagebox.askyesno(
-            "Rollback Changes",
-            f"Discard all changes to '{name}'?\n\nThis cannot be undone.",
-            parent=self.root
-        )
-        if confirm:
-            rc, _, stderr = self._run_git(['checkout', '--', rel_path])
-            if rc == 0:
-                self.status_bar.config(text=f"Rolled back: {name}")
-                self._refresh_git_panel()
-                # Update any open tab of this file with reverted content
-                tab_idx = self.tabbed_editor.find_tab_by_path(file_path)
-                if tab_idx >= 0:
-                    try:
-                        with open(file_path, 'r', encoding='utf-8') as f:
-                            new_content = f.read()
-                        tab = self.tabbed_editor._tabs[tab_idx]
-                        editor = tab['editor']
-                        editor.set_text(new_content)
-                        editor.set_saved()
-                    except Exception as e:
-                        self.status_bar.config(text=f"Error reloading file: {e}")
-                # Close diff tab for this file
-                diff_title = f'Diff: {name}'
-                for i, tab in enumerate(self.tabbed_editor._tabs):
-                    if tab['title'] == diff_title:
-                        self.tabbed_editor.close_tab(i)
-                        break
-            else:
-                self.status_bar.config(text=f"Rollback failed: {stderr.strip()}")
-
-    def _git_open_selected(self):
-        """Open the right-clicked file in an editor tab."""
-        info = self._git_right_clicked_file
-        if info and info[0]:
-            rel_path, file_path = info
-            if os.path.isfile(file_path):
-                self._open_file_in_tab(file_path)
-
-    def _git_show_diff(self):
-        """Show git diff for the right-clicked file."""
-        info = self._git_right_clicked_file
-        if info and info[0]:
-            self._show_diff_for(info[0])
-
-    def _show_diff_for(self, rel_path):
-        """Create a tab showing git diff for the given relative path."""
-        _, diff, _ = self._run_git(['diff', '--', rel_path])
-        if not diff.strip():
-            _, diff, _ = self._run_git(['diff', '--cached', '--', rel_path])
-
-        title = f'Diff: {os.path.basename(rel_path)}'
-        content = diff if diff.strip() else '(no changes)'
-        # Check if a diff tab already exists for this file
-        for i, tab in enumerate(self.tabbed_editor._tabs):
-            if tab['title'] == title:
-                self.tabbed_editor.switch_to_tab(i)
-                # Update content
-                tab['editor'].set_text(content)
-                tab['editor'].set_saved()
-                return
-        self.tabbed_editor.add_tab(title=title, content=content)
-
-    def _update_git_buttons(self):
-        """Show/hide git buttons based on current state."""
-        folder_open = self.current_folder is not None
-        has_git = False
-        if folder_open:
-            has_git = os.path.isdir(os.path.join(self.current_folder, '.git'))
-
-        # Clone: only visible when no folder is open
-        if folder_open:
-            self._git_btns['clone'].grid_remove()
-        else:
-            self._git_btns['clone'].grid()
-
-        # Init: visible only when folder is open AND no .git exists
-        if folder_open and not has_git:
-            self._git_btns['init'].grid()
-        else:
-            self._git_btns['init'].grid_remove()
-
-        # Remote: visible only when folder is open
-        if folder_open:
-            self._git_btns['remote'].grid()
-        else:
-            self._git_btns['remote'].grid_remove()
-
-        # Commit msg entry, commit button: visible when folder is open
-        if folder_open and has_git:
-            self._commit_msg_entry.grid()
-            self._git_btns['commit'].grid()
-        else:
-            self._commit_msg_entry.grid_remove()
-            self._git_btns['commit'].grid_remove()
 
     # ---- File opening helpers ----------------------------------------------
 
@@ -895,6 +600,66 @@ class MarkdownEditor:
             content=content,
         )
         self.status_bar.config(text=f"Opened: {os.path.basename(file_path)}")
+
+    # ---- Bridge callbacks for FileTreePanel / GitPanel ---------------------
+
+    def _on_file_deleted(self, path):
+        """Close any open tab for a deleted file."""
+        existing = self.tabbed_editor.find_tab_by_path(path)
+        if existing >= 0:
+            self.tabbed_editor._tabs[existing]['editor'].set_saved()
+            self.tabbed_editor.close_tab(existing)
+            if self.tabbed_editor.get_tab_count() == 0:
+                self.tabbed_editor.add_tab(content='')
+
+    def _on_file_path_changed(self, old_path, new_path):
+        """Update tab path after a rename/move operation."""
+        existing = self.tabbed_editor.find_tab_by_path(old_path)
+        if existing >= 0:
+            self.tabbed_editor.set_tab_path(
+                self.tabbed_editor._tabs[existing]['id'], new_path)
+
+    def _on_git_folder_opened(self, folder):
+        """Handle folder opened after git clone — update app state."""
+        self.current_folder = folder
+        self.venv_manager.set_folder(folder)
+        self.file_tree.populate(folder)
+        self._sys_term.cd_to(folder)
+        self.status_bar.config(text=f"Opened: {os.path.basename(folder)}")
+        self._update_venv_status()
+        if self.venv_manager.is_active:
+            self._apply_venv_to_subsystems()
+
+    def _reload_file_in_tab(self, file_path):
+        """Reload file content in an open tab (e.g. after git rollback)."""
+        tab_idx = self.tabbed_editor.find_tab_by_path(file_path)
+        if tab_idx >= 0:
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    new_content = f.read()
+                tab = self.tabbed_editor._tabs[tab_idx]
+                tab['editor'].set_text(new_content)
+                tab['editor'].set_saved()
+            except Exception as e:
+                self.status_bar.config(text=f"Error reloading file: {e}")
+
+    def _close_diff_tab(self, base_name):
+        """Close the diff tab for the given file base name."""
+        diff_title = f'Diff: {base_name}'
+        for i, tab in enumerate(self.tabbed_editor._tabs):
+            if tab['title'] == diff_title:
+                self.tabbed_editor.close_tab(i)
+                break
+
+    def _open_diff_tab(self, title, content):
+        """Open or update a diff tab with the given title and content."""
+        for i, tab in enumerate(self.tabbed_editor._tabs):
+            if tab['title'] == title:
+                self.tabbed_editor.switch_to_tab(i)
+                tab['editor'].set_text(content)
+                tab['editor'].set_saved()
+                return
+        self.tabbed_editor.add_tab(title=title, content=content)
 
     # ---- Save helpers ------------------------------------------------------
 
@@ -937,10 +702,10 @@ class MarkdownEditor:
         if folder_path:
             self.current_folder = folder_path
             self.venv_manager.set_folder(folder_path)
-            self.populate_file_tree(folder_path)
+            self.file_tree.populate(folder_path)
             self._sys_term.cd_to(folder_path)
             self.status_bar.config(text=f"Opened folder: {os.path.basename(folder_path)}")
-            self._refresh_git_panel()
+            self.git_panel.refresh()
             self._update_venv_status()
             if self.venv_manager.is_active:
                 self._apply_venv_to_subsystems()
@@ -949,48 +714,11 @@ class MarkdownEditor:
         """Close the currently opened folder, clear file tree and git panel."""
         self.current_folder = None
         self.venv_manager.set_folder(None)
-        self.file_tree.delete(*self.file_tree.get_children())
-        self._refresh_git_panel()
+        self.file_tree.populate("")  # clears the tree
+        self.git_panel.refresh()
         self._update_venv_status()
         self._apply_venv_to_subsystems()
         self.status_bar.config(text="Folder closed")
-
-    def populate_file_tree(self, folder_path):
-        self.file_tree.delete(*self.file_tree.get_children())
-
-        def add_tree_items(path, parent_id):
-            try:
-                items = sorted(os.listdir(path), key=lambda x: (not os.path.isdir(os.path.join(path, x)), x.lower()))
-                for item in items:
-                    full_path = os.path.join(path, item)
-                    if os.path.isdir(full_path):
-                        if item.startswith('.'):
-                            continue
-                        node_id = self.file_tree.insert(parent_id, "end", text=f"📁 {item}", values=(full_path,), tags=("dir",), open=False)
-                        add_tree_items(full_path, node_id)
-                    else:
-                        self.file_tree.insert(parent_id, "end", text=f"📄 {item}", values=(full_path,), tags=("file",))
-            except PermissionError:
-                pass
-
-        add_tree_items(folder_path, "")
-
-    def refresh_file_tree(self):
-        if self.current_folder:
-            self.populate_file_tree(self.current_folder)
-            self.status_bar.config(text="File tree refreshed")
-        else:
-            self.status_bar.config(text="No folder opened")
-
-    def on_tree_double_click(self, _):
-        selection = self.file_tree.selection()
-        if selection:
-            item = selection[0]
-            values = self.file_tree.item(item, "values")
-            if values:
-                file_path = values[0]
-                if os.path.isfile(file_path):
-                    self._open_file_in_tab(file_path)
 
     def save_file(self):
         tab = self.tabbed_editor.get_active_tab()
@@ -1129,212 +857,6 @@ class MarkdownEditor:
             self.editor_context_menu.tk_popup(event.x_root, event.y_root)
         finally:
             self.editor_context_menu.grab_release()
-
-    # ---- File tree helpers -------------------------------------------------
-
-    def get_selected_path(self):
-        selection = self.file_tree.selection()
-        if selection:
-            item = selection[0]
-            values = self.file_tree.item(item, "values")
-            if values:
-                return values[0]
-        return self.current_folder
-
-    def show_new_menu(self):
-        if not self.current_folder:
-            self.new_file()
-            return
-
-        menu = tk.Menu(self.root, tearoff=0)
-        menu.add_command(label="New File", command=self.new_file_in_tree)
-        menu.add_command(label="New Folder", command=self.new_folder_in_tree)
-        menu.post(self.file_tree.winfo_rootx() + 50, self.file_tree.winfo_rooty() + 10)
-
-    def show_context_menu(self, event):
-        if not self.current_folder:
-            return
-        item = self.file_tree.identify_row(event.y)
-        if item:
-            self.file_tree.selection_set(item)
-        self.context_menu.post(event.x_root, event.y_root)
-
-    def new_file_in_tree(self):
-        if not self.current_folder:
-            self.new_file()
-            return
-
-        parent_path = self.get_selected_path()
-        if parent_path and os.path.isfile(parent_path):
-            parent_path = os.path.dirname(parent_path)
-
-        if parent_path:
-            filename = simpledialog.askstring(
-                "New File", "Enter file name:",
-                parent=self.root
-            )
-            if filename:
-                new_file_path = os.path.join(parent_path, filename)
-                try:
-                    with open(new_file_path, 'w', encoding='utf-8') as f:
-                        f.write('')
-                    self.populate_file_tree(self.current_folder)
-                    self.status_bar.config(text=f"Created: {filename}")
-                except Exception as e:
-                    self.status_bar.config(text=f"Error creating file: {e}")
-
-    def new_folder_in_tree(self):
-        if not self.current_folder:
-            self.status_bar.config(text="No folder opened")
-            return
-
-        parent_path = self.get_selected_path()
-        if parent_path and os.path.isfile(parent_path):
-            parent_path = os.path.dirname(parent_path)
-
-        if parent_path:
-            foldername = simpledialog.askstring("New Folder", "Enter folder name:", parent=self.root)
-            if foldername:
-                new_folder_path = os.path.join(parent_path, foldername)
-                try:
-                    os.makedirs(new_folder_path, exist_ok=False)
-                    self.populate_file_tree(self.current_folder)
-                    self.status_bar.config(text=f"Created folder: {foldername}")
-                except FileExistsError:
-                    self.status_bar.config(text=f"Folder already exists: {foldername}")
-                except Exception as e:
-                    self.status_bar.config(text=f"Error creating folder: {e}")
-
-    def delete_selected(self):
-        if not self.current_folder:
-            self.status_bar.config(text="No folder opened")
-            return
-
-        selection = self.file_tree.selection()
-        if not selection:
-            return
-
-        item = selection[0]
-        values = self.file_tree.item(item, "values")
-        if not values:
-            return
-
-        path = values[0]
-        item_text = self.file_tree.item(item, "text")
-        name = item_text.split(' ', 1)[1] if ' ' in item_text else item_text
-
-        item_type = "folder" if os.path.isdir(path) else "file"
-        confirm = messagebox.askyesno(
-            "Confirm Delete",
-            f"Are you sure you want to delete the {item_type} '{name}'?",
-            parent=self.root
-        )
-
-        if confirm:
-            try:
-                if os.path.isdir(path):
-                    import shutil
-                    shutil.rmtree(path)
-                else:
-                    os.remove(path)
-                self.populate_file_tree(self.current_folder)
-                self.status_bar.config(text=f"Deleted: {name}")
-
-                # Close the tab if the deleted file is open
-                existing = self.tabbed_editor.find_tab_by_path(path)
-                if existing >= 0:
-                    # Force close without unsaved prompt (file already deleted)
-                    self.tabbed_editor._tabs[existing]['editor'].set_saved()
-                    self.tabbed_editor.close_tab(existing)
-                    if self.tabbed_editor.get_tab_count() == 0:
-                        self.tabbed_editor.add_tab(content='')
-            except Exception as e:
-                self.status_bar.config(text=f"Error deleting: {e}")
-
-    def rename_selected(self):
-        if not self.current_folder:
-            self.status_bar.config(text="No folder opened")
-            return
-
-        selection = self.file_tree.selection()
-        if not selection:
-            return
-
-        item = selection[0]
-        values = self.file_tree.item(item, "values")
-        if not values:
-            return
-
-        path = values[0]
-        item_text = self.file_tree.item(item, "text")
-        old_name = item_text.split(' ', 1)[1] if ' ' in item_text else item_text
-
-        new_name = simpledialog.askstring("Rename", "Enter new name:", initialvalue=old_name, parent=self.root)
-        if new_name and new_name != old_name:
-            parent_dir = os.path.dirname(path)
-            new_path = os.path.join(parent_dir, new_name)
-            try:
-                import shutil
-                shutil.move(path, new_path)
-                self.populate_file_tree(self.current_folder)
-
-                # Update tab if this file is open
-                existing = self.tabbed_editor.find_tab_by_path(path)
-                if existing >= 0:
-                    self.tabbed_editor.set_tab_path(
-                        self.tabbed_editor._tabs[existing]['id'], new_path)
-
-                self.status_bar.config(text=f"Renamed to: {new_name}")
-            except Exception as e:
-                self.status_bar.config(text=f"Error renaming: {e}")
-
-    def move_selected(self):
-        if not self.current_folder:
-            self.status_bar.config(text="No folder opened")
-            return
-
-        selection = self.file_tree.selection()
-        if not selection:
-            return
-
-        item = selection[0]
-        values = self.file_tree.item(item, "values")
-        if not values:
-            return
-
-        source_path = values[0]
-        item_text = self.file_tree.item(item, "text")
-        name = item_text.split(' ', 1)[1] if ' ' in item_text else item_text
-
-        dest_dir = filedialog.askdirectory(title="Select destination folder", initialdir=self.current_folder)
-        if dest_dir:
-            dest_path = os.path.join(dest_dir, name)
-            try:
-                import shutil
-                if os.path.exists(dest_path):
-                    overwrite = messagebox.askyesno(
-                        "File Exists",
-                        f"'{name}' already exists in the destination. Overwrite?",
-                        parent=self.root
-                    )
-                    if not overwrite:
-                        return
-                    if os.path.isdir(dest_path):
-                        shutil.rmtree(dest_path)
-                    else:
-                        os.remove(dest_path)
-                shutil.move(source_path, dest_path)
-                self.populate_file_tree(self.current_folder)
-
-                # Update tab if this file is open
-                existing = self.tabbed_editor.find_tab_by_path(source_path)
-                if existing >= 0:
-                    self.tabbed_editor.set_tab_path(
-                        self.tabbed_editor._tabs[existing]['id'], dest_path)
-
-                self.status_bar.config(text=f"Moved to: {dest_dir}")
-            except Exception as e:
-                self.status_bar.config(text=f"Error moving: {e}")
 
     # ---- Search ------------------------------------------------------------
 
@@ -1492,411 +1014,3 @@ class MarkdownEditor:
 
         search_dir(folder)
         return sorted(results, key=lambda x: x[0])
-
-    # ---- Git operations ----------------------------------------------------
-
-    def git_clone(self):
-        clone_dialog = tk.Toplevel(self.root)
-        clone_dialog.title("Clone Repository")
-        clone_dialog.geometry("500x200")
-        clone_dialog.transient(self.root)
-        clone_dialog.grab_set()
-
-        ttk.Label(clone_dialog, text="Repository URL:").pack(anchor="w", padx=10, pady=(10, 5))
-
-        url_var = tk.StringVar()
-        url_entry = ttk.Entry(clone_dialog, textvariable=url_var)
-        url_entry.pack(fill=tk.X, padx=10, pady=5)
-        url_entry.focus()
-
-        ttk.Label(clone_dialog, text="Destination Directory:").pack(anchor="w", padx=10, pady=(10, 5))
-
-        dest_frame = ttk.Frame(clone_dialog)
-        dest_frame.pack(fill=tk.X, padx=10, pady=5)
-
-        dest_var = tk.StringVar(value=os.path.expanduser('~'))
-        dest_entry = ttk.Entry(dest_frame, textvariable=dest_var)
-        dest_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        def browse_dest():
-            dest_dir = filedialog.askdirectory(title="Select Destination", initialdir=dest_var.get())
-            if dest_dir:
-                dest_var.set(dest_dir)
-
-        ttk.Button(dest_frame, text="Browse...", command=browse_dest).pack(side=tk.LEFT, padx=5)
-
-        def do_clone():
-            url = url_var.get().strip()
-            dest = dest_var.get().strip()
-
-            if not url:
-                messagebox.showwarning("Missing URL", "Please enter repository URL", parent=clone_dialog)
-                return
-
-            if not dest:
-                messagebox.showwarning("Missing Destination", "Please select destination directory", parent=clone_dialog)
-                return
-
-            try:
-                result = subprocess.run(
-                    ['git', '-c', 'core.quotePath=false', 'clone', url, dest],
-                    capture_output=True,
-                    encoding='utf-8',
-                    errors='replace',
-                    timeout=120
-                )
-
-                if result.returncode == 0:
-                    self.status_bar.config(text="Repository cloned successfully")
-                    clone_dialog.destroy()
-                    messagebox.showinfo("Success", "Repository cloned successfully", parent=self.root)
-                    self.current_folder = dest
-                    self.venv_manager.set_folder(dest)
-                    self.populate_file_tree(dest)
-                    self._sys_term.cd_to(dest)
-                    self.status_bar.config(text=f"Opened: {os.path.basename(dest)}")
-                    self._update_venv_status()
-                    if self.venv_manager.is_active:
-                        self._apply_venv_to_subsystems()
-                    self._update_git_buttons()
-                else:
-                    error_msg = result.stderr if result.stderr else result.stdout
-                    messagebox.showerror("Error", f"Failed to clone repository:\n{error_msg}", parent=clone_dialog)
-            except FileNotFoundError:
-                messagebox.showerror("Error", "Git not found. Please install git.", parent=clone_dialog)
-            except subprocess.TimeoutExpired:
-                messagebox.showerror("Error", "Clone operation timed out", parent=clone_dialog)
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to clone:\n{str(e)}", parent=clone_dialog)
-
-        button_frame = ttk.Frame(clone_dialog)
-        button_frame.pack(fill=tk.X, padx=10, pady=(10, 10))
-
-        ttk.Button(button_frame, text="Clone", command=do_clone).pack(side=tk.RIGHT)
-        ttk.Button(button_frame, text="Cancel", command=clone_dialog.destroy).pack(side=tk.RIGHT, padx=5)
-
-        url_entry.bind("<Return>", lambda _: do_clone())
-
-    def git_init(self):
-        if not self.current_folder:
-            messagebox.showwarning("No Folder", "Please open a folder first", parent=self.root)
-            return
-
-        confirm = messagebox.askyesno(
-            "Init Git Repository",
-            f"Initialize git repository in:\n{self.current_folder}?",
-            parent=self.root
-        )
-        if confirm:
-            returncode, stdout, stderr = self._run_git(['init'])
-            if returncode == 0:
-                self.status_bar.config(text="Git repository initialized")
-                messagebox.showinfo("Success", "Git repository initialized successfully", parent=self.root)
-                self._update_git_buttons()
-            else:
-                self.status_bar.config(text=f"Git init failed: {stderr}")
-                messagebox.showerror("Error", f"Failed to initialize git:\n{stderr}", parent=self.root)
-
-    def git_set_remote(self):
-        if not self.current_folder:
-            messagebox.showwarning("No Folder", "Please open a folder first", parent=self.root)
-            return
-
-        returncode, _, _ = self._run_git(['status'])
-        if returncode != 0:
-            messagebox.showwarning("Not a Git Repository", "Please initialize git first", parent=self.root)
-            return
-
-        returncode, stdout, _ = self._run_git(['remote', '-v'])
-        current_remote = ""
-        if returncode == 0 and stdout.strip():
-            current_remote = f"\nCurrent remotes:\n{stdout}"
-
-        remote_url = simpledialog.askstring(
-            "Set Git Remote",
-            f"Enter remote URL:{current_remote}\n\nExamples:\nhttps://github.com/username/repo.git\ngit@github.com:username/repo.git",
-            parent=self.root
-        )
-        if remote_url:
-            returncode, _, _ = self._run_git(['remote', 'get-url', 'origin'])
-            if returncode == 0:
-                returncode, stdout, stderr = self._run_git(['remote', 'set-url', 'origin', remote_url])
-            else:
-                returncode, stdout, stderr = self._run_git(['remote', 'add', 'origin', remote_url])
-
-            if returncode == 0:
-                self.status_bar.config(text="Remote set successfully")
-                messagebox.showinfo("Success", "Remote URL set successfully", parent=self.root)
-            else:
-                self.status_bar.config(text=f"Failed to set remote: {stderr}")
-                messagebox.showerror("Error", f"Failed to set remote:\n{stderr}", parent=self.root)
-
-    def git_commit(self):
-        if not self.current_folder:
-            messagebox.showwarning("No Folder", "Please open a folder first", parent=self.root)
-            return
-
-        returncode, _, stderr = self._run_git(['status'])
-        if returncode != 0:
-            messagebox.showwarning("Not a Git Repository", "Please initialize git first", parent=self.root)
-            return
-
-        # Get commit message from the entry field, fall back to dialog if placeholder
-        commit_msg = self._commit_msg_var.get().strip()
-        if not commit_msg or commit_msg == "Enter commit message...":
-            commit_msg = simpledialog.askstring(
-                "Git Commit",
-                "Enter commit message:",
-                parent=self.root
-            )
-        if commit_msg:
-            returncode, stdout, stderr = self._run_git(['add', '.'])
-            if returncode != 0:
-                messagebox.showerror("Error", f"Failed to stage files:\n{stderr}", parent=self.root)
-                return
-
-            returncode, stdout, stderr = self._run_git(['commit', '-m', commit_msg])
-            if returncode == 0:
-                self.status_bar.config(text=f"Committed: {commit_msg}")
-                self._commit_msg_var.set("")
-                self._commit_msg_entry.insert(0, "Enter commit message...")
-                messagebox.showinfo("Success", f"Changes committed:\n{commit_msg}", parent=self.root)
-                self._refresh_git_panel()
-            else:
-                self.status_bar.config(text=f"Commit failed: {stderr}")
-                messagebox.showerror("Error", f"Failed to commit:\n{stderr}", parent=self.root)
-
-    def git_pull(self):
-        if not self.current_folder:
-            messagebox.showwarning("No Folder", "Please open a folder first", parent=self.root)
-            return
-
-        returncode, _, _ = self._run_git(['status'])
-        if returncode != 0:
-            messagebox.showwarning("Not a Git Repository", "Please initialize git first", parent=self.root)
-            return
-
-        confirm = messagebox.askyesno("Git Pull", "Pull changes from remote?", parent=self.root)
-        if confirm:
-            returncode, stdout, stderr = self._run_git(['pull'])
-            if returncode == 0:
-                self.status_bar.config(text="Pull successful")
-                messagebox.showinfo("Success", f"Pull successful:\n{stdout}", parent=self.root)
-                self.populate_file_tree(self.current_folder)
-                self._refresh_git_panel()
-            else:
-                self.status_bar.config(text=f"Pull failed: {stderr}")
-                messagebox.showerror("Error", f"Failed to pull:\n{stderr}", parent=self.root)
-
-    def git_push(self):
-        if not self.current_folder:
-            messagebox.showwarning("No Folder", "Please open a folder first", parent=self.root)
-            return
-
-        returncode, _, _ = self._run_git(['status'])
-        if returncode != 0:
-            messagebox.showwarning("Not a Git Repository", "Please initialize git first", parent=self.root)
-            return
-
-        returncode, stdout, _ = self._run_git(['remote', 'get-url', 'origin'])
-        if returncode != 0:
-            messagebox.showwarning("No Remote", "Please set remote URL first", parent=self.root)
-            return
-
-        returncode, branch_stdout, _ = self._run_git(['branch', '--show-current'])
-        current_branch = branch_stdout.strip() if returncode == 0 else 'main'
-
-        returncode, _, _ = self._run_git(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'])
-
-        confirm = messagebox.askyesno("Git Push", "Push changes to remote?", parent=self.root)
-        if confirm:
-            if returncode != 0:
-                returncode, stdout, stderr = self._run_git(['push', '--set-upstream', 'origin', current_branch])
-            else:
-                returncode, stdout, stderr = self._run_git(['push'])
-
-            if returncode == 0:
-                self.status_bar.config(text="Push successful")
-                messagebox.showinfo("Success", f"Push successful:\n{stdout}", parent=self.root)
-            else:
-                self.status_bar.config(text=f"Push failed: {stderr}")
-                messagebox.showerror("Error", f"Failed to push:\n{stderr}", parent=self.root)
-
-    def _refresh_commit_log(self):
-        """Refresh the inline commit log widget."""
-        if not self.current_folder:
-            return
-        returncode, stdout, stderr = self._run_git(
-            ['log', '--oneline', '--graph', '--all', '-20'])
-        self._git_log_text.config(state=tk.NORMAL)
-        self._git_log_text.delete(1.0, tk.END)
-        if returncode != 0:
-            self._git_log_text.insert(tk.END, f"Error: {stderr}")
-        elif not stdout.strip():
-            self._git_log_text.insert(tk.END, "No commits yet")
-        else:
-            self._git_log_text.insert(tk.END, stdout)
-        self._git_log_text.config(state=tk.DISABLED)
-
-    def _on_commit_msg_focus_in(self, event):
-        """Clear placeholder text when entry gets focus."""
-        if self._commit_msg_var.get() == "Enter commit message...":
-            self._commit_msg_var.set("")
-
-    def _on_commit_msg_focus_out(self, event):
-        """Restore placeholder text when entry loses focus and is empty."""
-        if not self._commit_msg_var.get().strip():
-            self._commit_msg_var.set("Enter commit message...")
-
-    # ---- Branch management popup -----------------------------------------
-
-    def _show_branch_popup(self, event=None):
-        """Show a popup dialog listing local branches, with switch and create actions."""
-        if not self.current_folder:
-            return
-
-        has_git = os.path.isdir(os.path.join(self.current_folder, '.git'))
-        if not has_git:
-            return
-
-        # Get branch info
-        _, current_branch, _ = self._run_git(['branch', '--show-current'])
-        current_branch = current_branch.strip()
-
-        _, output, _ = self._run_git(['branch'])
-        branches = [b.lstrip('* ').strip() for b in output.splitlines() if b.strip()]
-
-        popup = tk.Toplevel(self.root)
-        popup.title("Branches")
-        popup.geometry("300x350")
-        popup.transient(self.root)
-        popup.grab_set()
-
-        ttk.Label(popup, text="Local Branches",
-                  font=("Helvetica", 11, "bold")).pack(anchor="w", padx=10, pady=(10, 5))
-
-        list_frame = ttk.Frame(popup)
-        list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-
-        list_scroll = ttk.Scrollbar(list_frame)
-        list_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-
-        branch_list = tk.Listbox(list_frame, yscrollcommand=list_scroll.set,
-                                 font=("Monaco", 11), selectmode=tk.SINGLE)
-        branch_list.pack(fill=tk.BOTH, expand=True)
-        list_scroll.config(command=branch_list.yview)
-
-        # Populate branches, select current
-        for i, b in enumerate(branches):
-            branch_list.insert(tk.END, b)
-            if b == current_branch:
-                branch_list.selection_set(i)
-                branch_list.see(i)
-                branch_list.itemconfig(i, {'bg': '#d0e0f0'})
-
-        def do_switch():
-            sel = branch_list.curselection()
-            if not sel:
-                return
-            target = branch_list.get(sel[0])
-            if target == current_branch:
-                return
-            self._switch_to_branch(target, popup)
-
-        def do_create():
-            self._create_and_switch_branch(popup, current_branch)
-
-        # Double-click to switch
-        branch_list.bind('<Double-Button-1>', lambda e: do_switch())
-
-        btn_frame = ttk.Frame(popup)
-        btn_frame.pack(fill=tk.X, padx=10, pady=(5, 10))
-
-        ttk.Button(btn_frame, text="Switch", command=do_switch).pack(side=tk.LEFT)
-        ttk.Button(btn_frame, text="New", command=do_create).pack(side=tk.LEFT)
-        ttk.Button(btn_frame, text="Close", command=popup.destroy).pack(side=tk.RIGHT)
-
-    def _switch_to_branch(self, branch_name, popup):
-        """Check out the given branch and refresh state."""
-        returncode, _, stderr = self._run_git(['checkout', branch_name])
-        if returncode != 0:
-            messagebox.showerror("Switch Branch Failed",
-                                 f"Could not switch to '{branch_name}':\n{stderr}",
-                                 parent=self.root)
-            return
-        self.status_bar.config(text=f"Switched to branch: {branch_name}")
-        popup.destroy()
-        self._refresh_git_panel()
-        self.populate_file_tree(self.current_folder)
-
-    def _create_and_switch_branch(self, popup, current_branch):
-        """Create a new branch from current branch and switch to it."""
-        new_name = simpledialog.askstring(
-            "New Branch", "Enter new branch name:",
-            parent=popup
-        )
-        if not new_name:
-            return
-
-        returncode, _, stderr = self._run_git(['checkout', '-b', new_name])
-        if returncode != 0:
-            messagebox.showerror("Create Branch Failed",
-                                 f"Could not create branch '{new_name}':\n{stderr}",
-                                 parent=self.root)
-            return
-        self.status_bar.config(text=f"Created and switched to branch: {new_name}")
-        popup.destroy()
-        self._refresh_git_panel()
-        self.populate_file_tree(self.current_folder)
-
-    def show_git_log(self):
-        if not self.current_folder:
-            messagebox.showwarning("No Folder", "Please open a folder first", parent=self.root)
-            return
-
-        returncode, _, _ = self._run_git(['status'])
-        if returncode != 0:
-            messagebox.showwarning("Not a Git Repository", "Please initialize git first", parent=self.root)
-            return
-
-        returncode, stdout, stderr = self._run_git(['log', '--oneline', '--graph', '--all', '-20'])
-        if returncode != 0:
-            messagebox.showerror("Error", f"Failed to get log:\n{stderr}", parent=self.root)
-            return
-
-        log_window = tk.Toplevel(self.root)
-        log_window.title("Git Log")
-        log_window.geometry("600x400")
-        log_window.transient(self.root)
-
-        btn_frame = ttk.Frame(log_window)
-        btn_frame.pack(fill=tk.X, padx=10, pady=10)
-
-        ttk.Button(btn_frame, text="Refresh", command=lambda: self.refresh_git_log(log_text)).pack(side=tk.RIGHT)
-        ttk.Button(btn_frame, text="Close", command=log_window.destroy).pack(side=tk.RIGHT, padx=5)
-
-        log_scroll = ttk.Scrollbar(log_window)
-        log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-
-        log_text = tk.Text(log_window, yscrollcommand=log_scroll.set, font=("Monaco", 11))
-        log_text.pack(fill=tk.BOTH, expand=True, padx=(10, 0), pady=(0, 10))
-        log_scroll.config(command=log_text.yview)
-
-        if not stdout.strip():
-            log_text.insert(tk.END, "No commits yet")
-        else:
-            log_text.insert(tk.END, stdout)
-
-        log_text.config(state=tk.DISABLED)
-
-    def refresh_git_log(self, log_text):
-        returncode, stdout, stderr = self._run_git(['log', '--oneline', '--graph', '--all', '-20'])
-        log_text.config(state=tk.NORMAL)
-        log_text.delete(1.0, tk.END)
-        if returncode != 0:
-            log_text.insert(tk.END, f"Error: {stderr}")
-        elif not stdout.strip():
-            log_text.insert(tk.END, "No commits yet")
-        else:
-            log_text.insert(tk.END, stdout)
-        log_text.config(state=tk.DISABLED)
