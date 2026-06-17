@@ -69,11 +69,23 @@ class MarkdownEditor:
         edit_menu.add_separator()
         edit_menu.add_command(label="Flash Parens", command=self.flash_paren, accelerator="Cmd+Shift+P")
         edit_menu.add_command(label="Keyword Hint", command=self.show_keyword_hint, accelerator="Cmd+Shift+K")
+        edit_menu.add_separator()
+        edit_menu.add_command(label="Go to Line", command=self.show_goto_line, accelerator="Cmd+L")
+
+        format_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Format", menu=format_menu)
+        format_menu.add_command(label="Indent Region", command=self.indent_region, accelerator="Cmd+]")
+        format_menu.add_command(label="Dedent Region", command=self.dedent_region, accelerator="Cmd+[")
+        format_menu.add_separator()
+        format_menu.add_command(label="Comment Out Region", command=self.comment_region, accelerator="Cmd+/")
+        format_menu.add_command(label="Uncomment Region", command=self.uncomment_region, accelerator="Cmd+Shift+/")
 
         run_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Run", menu=run_menu)
         run_menu.add_command(label="Run Module", command=self.run_current_file, accelerator="Cmd+R")
         run_menu.add_command(label="Run in Terminal", command=self.run_in_terminal, accelerator="Cmd+Shift+R")
+        run_menu.add_separator()
+        run_menu.add_command(label="Check Module", command=self.check_module, accelerator="Cmd+Shift+C")
 
         view_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="View", menu=view_menu)
@@ -82,7 +94,12 @@ class MarkdownEditor:
         search_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Search", menu=search_menu)
         search_menu.add_command(label="Find in File", command=self.show_find_dialog, accelerator="Cmd+F")
+        search_menu.add_command(label="Replace", command=self.show_replace_dialog, accelerator="Cmd+Shift+H")
         search_menu.add_command(label="Search in Files", command=self.show_search_dialog, accelerator="Cmd+Shift+F")
+
+        help_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Help", menu=help_menu)
+        help_menu.add_command(label="About tknote", command=self.show_about)
 
         # -- Editor context menu (right-click) --
         self.editor_context_menu = tk.Menu(self.root, tearoff=0)
@@ -251,8 +268,14 @@ class MarkdownEditor:
         editor.bind("<Command-Shift-Z>", lambda _: self.redo())
         editor.bind("<Command-Shift-P>", lambda _: self.flash_paren())
         editor.bind("<Command-Shift-K>", lambda _: self.show_keyword_hint())
+        editor.bind("<Command-l>", lambda _: self.show_goto_line())
         editor.bind("<Command-r>", lambda _: self.run_current_file())
         editor.bind("<Command-Shift-R>", lambda _: self.run_in_terminal())
+        editor.bind("<Command-bracketright>", lambda _: self.indent_region())
+        editor.bind("<Command-bracketleft>", lambda _: self.dedent_region())
+        editor.bind("<Command-slash>", lambda _: self.comment_region())
+        editor.bind("<Command-Shift-slash>", lambda _: self.uncomment_region())
+        editor.bind("<Command-Shift-H>", lambda _: self.show_replace_dialog())
         editor.bind("<Button-2>", self.show_editor_context_menu)
         editor.bind("<Button-3>", self.show_editor_context_menu)
         editor.bind("<Control-Button-1>", self.show_editor_context_menu)
@@ -783,7 +806,8 @@ class MarkdownEditor:
         except tk.TclError:
             pass
 
-        self._shell_panel.run_code(source, file_path=file_path)
+        self._shell_panel.run_code(source, file_path=file_path,
+                                   python_exe=self.venv_manager.get_python_exe())
         try:
             self.status_bar.config(text=f"Ran: {os.path.basename(file_path)}")
         except tk.TclError:
@@ -825,6 +849,120 @@ class MarkdownEditor:
             if not self.save_file_as():
                 return
             self.run_in_terminal()
+
+    def check_module(self):
+        """Syntax-check the current file without running it."""
+        tab = self.tabbed_editor.get_active_tab()
+        if not tab:
+            self.status_bar.config(text="No file to check")
+            return
+        source = tab['editor'].get_text()
+        try:
+            compile(source, tab.get('file_path', '<check>'), 'exec')
+            self.status_bar.config(text="Syntax OK")
+            messagebox.showinfo("Check Module", "No syntax errors found.", parent=self.root)
+        except SyntaxError as e:
+            self.status_bar.config(text=f"Syntax error at line {e.lineno}")
+            messagebox.showerror(
+                "Syntax Error",
+                f"Line {e.lineno}: {e.msg}",
+                parent=self.root,
+            )
+
+    # ---- Region / Navigation (delegates to active editor) -------------------
+
+    def comment_region(self):
+        editor = self.editor
+        if editor:
+            editor.comment_region()
+
+    def uncomment_region(self):
+        editor = self.editor
+        if editor:
+            editor.uncomment_region()
+
+    def indent_region(self):
+        editor = self.editor
+        if editor:
+            editor.indent_region()
+
+    def dedent_region(self):
+        editor = self.editor
+        if editor:
+            editor.dedent_region()
+
+    def show_goto_line(self):
+        """Dialog: jump to a line number."""
+        editor = self.editor
+        if editor is None:
+            return
+        max_line = int(float(editor.index('end-1c')))
+        lineno = simpledialog.askinteger(
+            "Go to Line",
+            f"Enter line number (1–{max_line}):",
+            parent=self.root,
+            minvalue=1,
+            maxvalue=max_line,
+        )
+        if lineno:
+            editor.go_to_line(lineno)
+            self.status_bar.config(text=f"Jumped to line {lineno}")
+
+    def show_replace_dialog(self):
+        """Dialog: find and replace text in the current file."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Replace")
+        dialog.geometry("420x180")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        ttk.Label(dialog, text="Find:").grid(row=0, column=0, sticky='w', padx=10, pady=(10, 2))
+        find_var = tk.StringVar()
+        find_entry = ttk.Entry(dialog, textvariable=find_var)
+        find_entry.grid(row=0, column=1, sticky='ew', padx=(0, 10), pady=(10, 2))
+        find_entry.focus()
+
+        ttk.Label(dialog, text="Replace with:").grid(row=1, column=0, sticky='w', padx=10, pady=2)
+        replace_var = tk.StringVar()
+        replace_entry = ttk.Entry(dialog, textvariable=replace_var)
+        replace_entry.grid(row=1, column=1, sticky='ew', padx=(0, 10), pady=2)
+
+        dialog.grid_columnconfigure(1, weight=1)
+
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.grid(row=2, column=0, columnspan=2, pady=(10, 5))
+
+        def do_replace():
+            query = find_var.get()
+            replacement = replace_var.get()
+            if not query:
+                return
+            editor = self.editor
+            if editor is None:
+                return
+            content = editor.get('1.0', 'end-1c')
+            new_content = content.replace(query, replacement)
+            if new_content != content:
+                editor.set_text(new_content)
+                self.status_bar.config(text=f"Replaced all occurrences")
+            else:
+                self.status_bar.config(text="No matches found")
+
+        ttk.Button(btn_frame, text="Replace All", command=do_replace).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="Close", command=dialog.destroy).pack(side=tk.LEFT, padx=2)
+
+        find_entry.bind('<Return>', lambda _: do_replace())
+        replace_entry.bind('<Return>', lambda _: do_replace())
+
+    def show_about(self):
+        """Show About dialog."""
+        messagebox.showinfo(
+            "About tknote",
+            "tknote — Python IDE\n\n"
+            "A lightweight IDE inspired by IDLE.\n"
+            "Built with tkinter.",
+            parent=self.root,
+        )
 
     # ---- Text formatting ---------------------------------------------------
 

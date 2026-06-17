@@ -249,6 +249,9 @@ class SystemTerminal(ttk.Frame):
     FG = '#d4d4d4'
     CURSOR = '#d4d4d4'
 
+    # Max lines in scrollback buffer (trim from top when exceeded)
+    _MAX_SCROLLBACK_LINES = 10_000
+
     def __init__(self, parent, cwd=None, **kwargs):
         super().__init__(parent, **kwargs)
         self._close_callback = None
@@ -260,6 +263,10 @@ class SystemTerminal(ttk.Frame):
         self._shell_master_fd = None
         self._reader_thread = None
         self._reader_stop = threading.Event()
+
+        # Pending output buffer (batch accumulated reads before UI dispatch)
+        self._pending_output: list[str] = []
+        self._output_scheduled = False
 
         self._build_ui()
         self._start_shell()
@@ -321,13 +328,13 @@ class SystemTerminal(ttk.Frame):
         self._ansi = _AnsiParser(self._shell_output)
         self._setup_ansi_tags()
 
-        # Key bindings
+        # Key bindings — keystrokes are forwarded to the PTY; macOS
+        # Command shortcuts fall back to default Text widget behaviour
+        # (Cmd+C copy, Cmd+A select-all) because _handle_shell_key returns
+        # None for them.
         self._shell_output.bind('<Key>', self._handle_shell_key)
         self._shell_output.bind('<Command-v>', self._handle_shell_paste)
         self._shell_output.bind('<Control-v>', self._handle_shell_paste)
-        self._shell_output.bind('<Command-c>', lambda e: None)
-        self._shell_output.bind('<Command-a>', lambda e: None)
-        self._shell_output.bind('<Command-x>', lambda e: None)
 
         # Dynamic terminal size — update PTY when widget resizes
         self._shell_output.bind('<Configure>', self._on_resize, add='+')
@@ -372,22 +379,37 @@ class SystemTerminal(ttk.Frame):
 
     # ── Dynamic terminal sizing ───────────────────────────────────────────────
 
+    def _measure_char_cell(self):
+        """Measure actual character-cell size from the current font.
+
+        Uses tkinter's font measurement for 'M' (average full-width glyph)
+        to derive rows/cols more accurately than a hardcoded guess.
+        """
+        try:
+            import tkinter.font as tkfont
+            f = tkfont.Font(font=self._shell_output.cget('font'))
+            char_w = f.measure('M')
+            line_h = f.metrics('linespace')
+            if char_w > 0 and line_h > 0:
+                return char_w, line_h
+        except Exception:
+            pass
+        return 7, 16  # fallback
+
     def _on_resize(self, event=None):
         """Debounced PTY window-size update when the widget is resized."""
         if self._resize_after_id is not None:
             self.after_cancel(self._resize_after_id)
-        self._resize_after_id = self.after(150, self._update_winsize)
+        self._resize_after_id = self.after(80, self._update_winsize)
 
     def _update_winsize(self):
         """Send TIOCSWINSZ to the PTY with current widget dimensions."""
+        self._resize_after_id = None
         fd = self._shell_master_fd
         if fd is None:
             return
         try:
-            font = self._shell_output.cget('font')
-            # Approximate: Monaco 12 → ~7 px per char wide, ~16 px per line tall
-            char_w = 7
-            line_h = 16
+            char_w, line_h = self._measure_char_cell()
             width_px = self._shell_output.winfo_width()
             height_px = self._shell_output.winfo_height()
             if width_px > 10 and height_px > 10:
@@ -447,106 +469,198 @@ class SystemTerminal(ttk.Frame):
         # Update window size once the widget has dimensions
         self.after(200, self._update_winsize)
 
-        # Activate venv after shell is ready
-        if self._venv_path:
-            activate_script = os.path.join(self._venv_path, 'bin', 'activate')
-            if os.path.isfile(activate_script):
-                self.after(500, lambda: self._write_pty(
-                    f"source '{activate_script}'\n".encode('utf-8')))
-
     def _append_shell_output(self, text):
         """Parse ANSI-coloured output and insert into the text widget.
 
         Handles backspace, carriage-return, and \\x1b[K (erase-to-end-of-line)
         so that inline progress bars and line-editing render correctly.
+
+        All widget mutations are batched inside a single try block and only
+        one ``see('insert')`` call is issued at the end — this dramatically
+        reduces tkinter round-trips for high-throughput output.
         """
+        w = self._shell_output
+
+        # ── Anchor insert to end-1c before any mutation ─────────────────
+        # The user may have clicked elsewhere in the widget, moving the
+        # insert mark.  Always reset it so PTY output is appended, not
+        # injected mid-document.
         try:
-            w = self._shell_output
+            w.mark_set('insert', 'end-1c')
+        except tk.TclError:
+            pass
 
-            # ── Preprocess raw text ──────────────────────────────────────
-            # \r\n → \n  (standard CRLF line ending)
-            text = text.replace('\r\n', '\n')
+        # ── Preprocess raw text ──────────────────────────────────────────
+        # \r\n → \n  (standard CRLF line ending)
+        text = text.replace('\r\n', '\n')
 
-            # Process backspaces: \b deletes one character.  When the
-            # character-to-erase is in the *current* chunk we remove it
-            # from the buffer; when it was in a *previous* chunk we
-            # delete one character directly from the widget.
-            if '\b' in text:
-                out = []
-                widget_del = 0
-                for ch in text:
-                    if ch == '\b':
-                        if out:
-                            out.pop()
-                        else:
-                            widget_del += 1
+        # Fast path for backspace processing using str.translate-style loop.
+        # When a visible character follows \b, the pair is collapsed; when
+        # \b appears at the start of a chunk (backspacing into previously
+        # rendered text), we delete one char from the widget.
+        if '\b' in text:
+            out: list[str] = []
+            pending_del = 0
+            for ch in text:
+                if ch == '\b':
+                    if out:
+                        out.pop()
                     else:
-                        out.append(ch)
-                text = ''.join(out)
-                for _ in range(widget_del):
-                    try:
-                        if w.compare('insert', '>', 'insert linestart'):
-                            w.delete('insert-1c', 'insert')
-                    except tk.TclError:
-                        break
+                        pending_del += 1
+                else:
+                    out.append(ch)
+            text = ''.join(out)
+            if pending_del:
+                # Batch-delete characters from the widget — all at the
+                # current insert position, moving backwards.
+                try:
+                    line_start = w.index('insert linestart')
+                    if w.compare('insert', '>', line_start):
+                        # Delete at most pending_del chars, but don't cross
+                        # the line-start boundary.
+                        target = f'insert -{pending_del}c'
+                        if w.compare(target, '<', line_start):
+                            target = line_start
+                        w.delete(target, 'insert')
+                except tk.TclError:
+                    pass
 
-            # Parse ANSI SGR sequences → (text, tags) segments
-            segments = self._ansi.feed(text)
+        # Parse ANSI SGR sequences → (text, tags) segments
+        segments = self._ansi.feed(text)
+        if not segments:
+            return
 
+        try:
+            # ── Build a flat list of (action, ...) to minimise tk calls ──
             for item in segments:
-                # ── Erase-to-end-of-line sentinel ────────────────────────
                 if item is _AnsiParser._ERASE_LINE:
-                    try:
-                        line_start = w.index('insert linestart')
-                        line_end = w.index('insert lineend')
-                        if w.compare('insert', '<', line_end):
-                            w.delete('insert', line_end)
-                    except tk.TclError:
-                        pass
+                    line_start = w.index('insert linestart')
+                    line_end = w.index('insert lineend')
+                    if w.compare('insert', '<', line_end):
+                        w.delete('insert', line_end)
                     continue
 
                 seg_text, tags = item
                 if not seg_text:
                     continue
 
-                # ── Carriage-return handling ─────────────────────────────
-                # \r moves cursor to start of current line; subsequent text
-                # overwrites (used by progress bars, inline status, etc.)
                 if '\r' in seg_text:
                     parts = seg_text.split('\r')
                     for i, part in enumerate(parts):
                         if i > 0:
-                            try:
-                                line_start = w.index('insert linestart')
+                            line_start = w.index('insert linestart')
+                            if part:
+                                # \r followed by text → overwrite line
                                 if w.compare(line_start, '<', 'insert'):
                                     w.delete(line_start, 'insert')
-                            except tk.TclError:
-                                pass
+                            # else: trailing \r with nothing after → just
+                            # position cursor at line start (no delete)
                         if part:
                             w.insert('insert', part, tags)
                 else:
                     w.insert('insert', seg_text, tags)
 
+            # ── Scroll to cursor once after all inserts ──────────────────
             w.see('insert')
+
+            # ── Trim scrollback buffer to prevent unbounded memory growth ─
+            self._trim_scrollback()
         except tk.TclError:
             pass
 
+    def _trim_scrollback(self):
+        """Remove oldest lines when scrollback exceeds the limit."""
+        try:
+            w = self._shell_output
+            # Count lines cheaply — end index gives line count (1-based)
+            end_line = int(w.index('end-1c').split('.')[0])
+            excess = end_line - self._MAX_SCROLLBACK_LINES
+            if excess > 0:
+                w.delete('1.0', f'{excess + 1}.0')
+        except (tk.TclError, ValueError, IndexError):
+            pass
+
     def _read_pty_output(self):
+        """Background thread: read PTY output and dispatch to UI thread.
+
+        Uses a short select timeout (20 ms) so keystrokes feel instant.
+        Accumulates consecutive small reads into a batch before scheduling
+        a single ``after_idle`` call, which reduces tkinter overhead when
+        the PTY produces many small writes in quick succession.
+
+        When the accumulated buffer ends with a lone ``\r`` the flush is
+        deferred so that a following ``\n`` arrives in the same batch and
+        ``\r\n`` → ``\n`` merging works correctly.
+        """
         fd = self._shell_master_fd
+        READ_SIZE = 8192
+        acc: list[str] = []
+
+        def _should_defer(combined: str) -> bool:
+            return combined.endswith('\r') and not combined.endswith('\r\n')
+
         while not self._reader_stop.is_set() and fd is not None:
             try:
-                r, _, _ = select.select([fd], [], [], 0.1)
+                r, _, _ = select.select([fd], [], [], 0.02)
                 if r:
-                    data = os.read(fd, 4096)
+                    data = os.read(fd, READ_SIZE)
                     if not data:
+                        if acc:
+                            self._schedule_output(''.join(acc))
+                            acc.clear()
                         break
                     decoded = data.decode('utf-8', errors='replace')
                     if decoded:
-                        self.after(0, lambda d=decoded: self._append_shell_output(d))
+                        acc.append(decoded)
+                        combined = ''.join(acc)
+                        # If the last read was less than READ_SIZE the PTY
+                        # has drained its current write — but defer flush
+                        # when the buffer ends with a lone \r to let a
+                        # following \n arrive in the same batch.
+                        if len(data) < READ_SIZE and not _should_defer(combined):
+                            self._schedule_output(combined)
+                            acc.clear()
+                elif acc:
+                    # No data available — flush now; a lone \r is safe
+                    # because _append_shell_output no longer deletes on
+                    # trailing \r (the timeout guarantees \n isn't coming).
+                    self._schedule_output(''.join(acc))
+                    acc.clear()
             except OSError:
+                if acc:
+                    self._schedule_output(''.join(acc))
+                    acc.clear()
                 break
+
         if not self._reader_stop.is_set():
             self.after(0, self._handle_shell_exit)
+
+    def _schedule_output(self, text: str):
+        """Schedule output rendering on the UI thread via after_idle.
+
+        ``after_idle`` coalesces multiple rapid-fire schedule calls into a
+        single callback when the event loop is free, reducing per-chunk
+        overhead while keeping the UI responsive.
+        """
+        if not self._output_scheduled:
+            self._output_scheduled = True
+            self.after_idle(self._flush_pending_output)
+        self._pending_output.append(text)
+
+    def _flush_pending_output(self):
+        """Drain the pending output buffer and render all accumulated text.
+
+        Swaps the buffer list atomically so that new data arriving from the
+        reader thread during rendering goes into a fresh list and is never
+        lost.
+        """
+        self._output_scheduled = False
+        pending = self._pending_output
+        self._pending_output = []
+        if not pending:
+            return
+        batch = ''.join(pending)
+        self._append_shell_output(batch)
 
     # ── Key handling ──────────────────────────────────────────────────────────
 
@@ -563,29 +677,24 @@ class SystemTerminal(ttk.Frame):
         if fd is None:
             return "break"
 
-        try:
-            self._shell_output.mark_set("insert", "end-1c")
-            self._shell_output.see("insert")
-        except tk.TclError:
-            pass
-
         keysym = event.keysym
         state = event.state
 
-        # macOS Command-key shortcuts
+        # macOS Command-key shortcuts — let default handling take over
+        # for copy / select-all (return None); Cmd+V is paste to PTY.
         if state & 0x10:
-            if keysym.lower() in ('c', 'a', 'x'):
-                return None
+            if keysym.lower() in ('c', 'a'):
+                return None          # → default Text copy / select-all
+            if keysym.lower() == 'x':
+                return "break"       # suppress cut (destructive in terminal)
             if keysym.lower() == 'v':
                 return self._handle_shell_paste(event)
             return "break"
 
-        # Control-key combinations
+        # Control-key combinations — send raw control characters to PTY.
+        # Ctrl+C always sends \x03 (SIGINT); use Cmd+C for copy instead.
         if state & 0x4 and len(keysym) == 1:
             c = keysym.lower()
-            if c == 'c' and self._has_selection():
-                self._shell_copy()
-                return "break"
             if 'a' <= c <= 'z':
                 self._write_pty((ord(c) - ord('a') + 1).to_bytes(1, 'big'))
                 return "break"
@@ -659,6 +768,12 @@ class SystemTerminal(ttk.Frame):
             self._start_shell()
 
     def _build_shell_env(self) -> dict:
+        """Build the environment dict for the shell subprocess.
+
+        When a venv path is configured, VIRTUAL_ENV is set and the venv's
+        ``bin`` directory is prepended to PATH so the shell starts with the
+        virtual environment already active — no need to ``source activate``.
+        """
         env = {**os.environ}
         # Use xterm-256color so programs emit SGR colour codes
         env['TERM'] = 'xterm-256color'
@@ -666,7 +781,8 @@ class SystemTerminal(ttk.Frame):
         env['COLORTERM'] = 'truecolor'
         if self._venv_path:
             bin_dir = os.path.join(self._venv_path, 'bin')
-            if os.path.isdir(bin_dir):
+            activate_script = os.path.join(bin_dir, 'activate')
+            if os.path.isdir(bin_dir) and os.path.isfile(activate_script):
                 env['VIRTUAL_ENV'] = self._venv_path
                 env['PATH'] = f"{bin_dir}:{env.get('PATH', '')}"
         return env

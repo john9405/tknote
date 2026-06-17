@@ -646,6 +646,91 @@ class EditorWidget(tk.Frame):
         """Force-show keyword hint for the word at the cursor."""
         self._keyword_hint.force_show()
 
+    # ── Region operations (IDLE-style) ───────────────────────────────────
+
+    def _get_selected_lines(self):
+        """Return (first_line, last_line) of the current selection.
+
+        If nothing is selected, uses the cursor line for both.
+        """
+        try:
+            first = int(float(self._text.index('sel.first')))
+            last = int(float(self._text.index('sel.last')))
+        except (tk.TclError, ValueError):
+            first = last = int(float(self._text.index('insert')))
+            return first, last
+        # If selection ends at column 0, it's the line above
+        if self._text.compare('sel.last', '==', f'{last}.0'):
+            last = max(first, last - 1)
+        return first, last
+
+    def comment_region(self):
+        """Comment out selected lines with '# ' (IDLE Alt+3)."""
+        first, last = self._get_selected_lines()
+        self._undo.undo_block_start()
+        try:
+            for line in range(first, last + 1):
+                self._text.insert(f'{line}.0', '# ')
+        finally:
+            self._undo.undo_block_stop()
+        # Re-select the region
+        self._text.tag_add('sel', f'{first}.0', f'{last + 1}.0')
+
+    def uncomment_region(self):
+        """Remove leading '# ' from selected lines (IDLE Alt+4)."""
+        first, last = self._get_selected_lines()
+        self._undo.undo_block_start()
+        try:
+            for line in range(first, last + 1):
+                content = self._text.get(f'{line}.0', f'{line}.0+2c')
+                if content == '# ':
+                    self._text.delete(f'{line}.0', f'{line}.0+2c')
+                elif content[:1] == '#':
+                    self._text.delete(f'{line}.0', f'{line}.0+1c')
+        finally:
+            self._undo.undo_block_stop()
+        self._text.tag_add('sel', f'{first}.0', f'{last + 1}.0')
+
+    def indent_region(self):
+        """Indent selected lines by one level (IDLE Ctrl+])."""
+        first, last = self._get_selected_lines()
+        self._undo.undo_block_start()
+        try:
+            indent = ' ' * 4
+            for line in range(first, last + 1):
+                self._text.insert(f'{line}.0', indent)
+        finally:
+            self._undo.undo_block_stop()
+        self._text.tag_add('sel', f'{first}.0', f'{last + 1}.0')
+
+    def dedent_region(self):
+        """Dedent selected lines by one level (IDLE Ctrl+[)."""
+        first, last = self._get_selected_lines()
+        self._undo.undo_block_start()
+        try:
+            for line in range(first, last + 1):
+                content = self._text.get(f'{line}.0', f'{line}.0+4c')
+                stripped = content.lstrip(' ')
+                removed = len(content) - len(stripped)
+                to_remove = min(removed, 4)
+                if to_remove > 0:
+                    self._text.delete(f'{line}.0', f'{line}.0+{to_remove}c')
+        finally:
+            self._undo.undo_block_stop()
+        self._text.tag_add('sel', f'{first}.0', f'{last + 1}.0')
+
+    def go_to_line(self, lineno):
+        """Jump to the given 1-based line number and center it."""
+        lineno = max(1, min(lineno, _get_end_linenumber(self._text)))
+        self._text.mark_set('insert', f'{lineno}.0')
+        self._text.see(f'{lineno}.0')
+        self.center('insert')
+        # Briefly highlight the line
+        self._text.tag_remove('goto_line', '1.0', 'end')
+        self._text.tag_add('goto_line', f'{lineno}.0', f'{lineno}.0 lineend')
+        self._text.tag_config('goto_line', background='#c8e6c9')
+        self._text.after(1500, lambda: self._text.tag_remove('goto_line', '1.0', 'end'))
+
     # ── Text widget delegation ────────────────────────────────────────────
 
     def get(self, *args):

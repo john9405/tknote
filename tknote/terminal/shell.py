@@ -495,7 +495,7 @@ class PythonShell(ttk.Frame):
         except Exception:
             pass
 
-    def run_code(self, source, file_path=None):
+    def run_code(self, source, file_path=None, python_exe=None):
         """Execute Python source — IDLE Run Module style.
 
         When *file_path* is provided and the file exists on disk, the
@@ -510,22 +510,26 @@ class PythonShell(ttk.Frame):
             The Python source code (used for in-process fallback only).
         file_path : str, optional
             If provided and exists on disk, launched via subprocess.
+        python_exe : str, optional
+            Python interpreter to use for subprocess execution.
+            Defaults to ``sys.executable``.
         """
         if file_path and os.path.isfile(file_path):
-            self._run_subprocess(file_path)
+            self._run_subprocess(file_path, python_exe=python_exe)
         else:
             self._run_inprocess(source, file_path)
 
-    def _run_subprocess(self, file_path):
+    def _run_subprocess(self, file_path, python_exe=None):
         """Launch *file_path* in a subprocess and capture output."""
         self.restart(file_path)
 
+        python = python_exe or sys.executable
         label = os.path.basename(file_path)
         self.write(f'── Running {label} ──\n', 'console')
 
         try:
             result = subprocess.run(
-                [sys.executable, '-u', file_path],
+                [python, '-u', file_path],
                 capture_output=True,
                 text=True,
                 cwd=os.path.dirname(file_path),

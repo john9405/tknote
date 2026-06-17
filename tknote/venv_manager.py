@@ -238,7 +238,6 @@ class VenvManager:
         """Return a short label for the status bar (e.g. '.venv')."""
         if not self._venv_path:
             return 'Python'
-        # Use the directory name relative to the project folder
         if self._current_folder:
             try:
                 rel = os.path.relpath(self._venv_path, self._current_folder)
@@ -247,3 +246,14 @@ class VenvManager:
             except ValueError:
                 pass
         return os.path.basename(self._venv_path)
+
+    def get_python_exe(self) -> str:
+        """Return the path to the active Python executable.
+
+        Uses the venv's python3 if active, otherwise sys.executable.
+        """
+        if self._venv_path:
+            venv_python = os.path.join(self._venv_path, 'bin', 'python3')
+            if os.path.isfile(venv_python):
+                return venv_python
+        return sys.executable
