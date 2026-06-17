@@ -1,5 +1,6 @@
 """PythonShell — idlelib-style single-Text-widget Python shell with iomark."""
 
+import bdb
 import code
 import os
 import sys
@@ -10,6 +11,7 @@ from ..infra.delegator import Delegator, Percolator
 from ..infra.undo import UndoDelegator
 from ..infra.color import ColorDelegator
 from ..infra.autoindent import AutoIndent
+from ..debugger import Debugger
 from .history import History
 
 
@@ -111,6 +113,8 @@ class PythonShell(ttk.Frame):
         self._history = None
         self._auto_indent = None
         self._added_sys_paths: list[str] = []
+        self._debugger = None      # Debugger instance (None = debug off)
+        self._open_source_callback = None  # (filename, lineno) callback
         self._build_ui()
         self._setup_percolator()
         self._setup_tags()
@@ -129,10 +133,6 @@ class PythonShell(ttk.Frame):
 
         ttk.Label(header, text='Python Shell', font=('Helvetica', 10, 'bold')).pack(
             side=tk.LEFT, padx=(4, 0), pady=(2, 0))
-
-        close_btn = ttk.Button(
-            header, text='×', width=1, command=self._on_close)
-        close_btn.pack(side=tk.RIGHT, padx=(0, 4), pady=(2, 0))
 
         # Separator
         ttk.Separator(self, orient=tk.HORIZONTAL).grid(
@@ -353,6 +353,13 @@ class PythonShell(ttk.Frame):
         self.showprompt()
 
     def _execute(self, source):
+        """Execute Python code — under debugger if active, otherwise normally."""
+        if self._debugger is not None:
+            self._execute_under_debugger(source)
+        else:
+            self._execute_normal(source)
+
+    def _execute_normal(self, source):
         """Execute Python code and capture stdout/stderr."""
         old_stdout = sys.stdout
         old_stderr = sys.stderr
@@ -364,6 +371,68 @@ class PythonShell(ttk.Frame):
         finally:
             sys.stdout = old_stdout
             sys.stderr = old_stderr
+
+    def _execute_under_debugger(self, source):
+        """Execute Python code under the debugger's control."""
+        old_stdout = sys.stdout
+        old_stderr = sys.stderr
+        sys.stdout = _ShellWriter(self, 'stdout')
+        sys.stderr = _ShellWriter(self, 'stderr')
+        try:
+            self._debugger.run(source)
+        except bdb.BdbQuit:
+            self.write("\n[DEBUG QUIT]\n", 'stderr')
+        except Exception:
+            # Runtime errors (ZeroDivisionError, etc.) — print traceback
+            # to the shell's stderr so the user can see what happened.
+            import traceback
+            traceback.print_exc()
+        finally:
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
+
+    # ── Debugger management ────────────────────────────────────────────────
+
+    def open_debugger(self, debugger_panel=None):
+        """Start the debugger and enable debug mode.
+
+        :param debugger_panel: Optional pre-created Debugger panel.
+            If not provided, one will be created (legacy mode).
+        """
+        if self._debugger is not None:
+            return
+        if debugger_panel is not None:
+            self._debugger = debugger_panel
+        else:
+            # Legacy: create standalone debugger (for testing)
+            self._debugger = Debugger(self.master, self)
+
+    def close_debugger(self):
+        """Stop the debugger and disable debug mode."""
+        if self._debugger is None:
+            return
+        try:
+            self._debugger.quit()
+        except Exception:
+            pass
+        self._debugger = None
+
+    def toggle_debugger(self):
+        """Toggle debug mode on/off."""
+        if self._debugger is not None:
+            self.close_debugger()
+            return False
+        else:
+            self.open_debugger()
+            return True
+
+    def is_debugging(self):
+        """Return True if the debugger is active."""
+        return self._debugger is not None
+
+    def get_debugger(self):
+        """Return the Debugger instance, or None."""
+        return self._debugger
 
     def _show_syntax_error(self, source):
         """Display a syntax error in the shell."""

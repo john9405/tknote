@@ -278,10 +278,6 @@ class SystemTerminal(ttk.Frame):
         ttk.Label(header, text='Terminal', font=('Helvetica', 10, 'bold')).pack(
             side=tk.LEFT, padx=(4, 0), pady=(2, 0))
 
-        close_btn = ttk.Button(
-            header, text='×', width=1, command=self._on_close)
-        close_btn.pack(side=tk.RIGHT, padx=(0, 4), pady=(2, 0))
-
         # Separator
         ttk.Separator(self, orient=tk.HORIZONTAL).grid(
             row=1, column=0, sticky='ew')

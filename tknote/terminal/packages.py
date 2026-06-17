@@ -65,11 +65,6 @@ class PackageManager(ttk.Frame):
         self._count_label = ttk.Label(toolbar, text='')
         self._count_label.pack(side=tk.RIGHT, padx=(8, 4))
 
-        # Close button
-        close_btn = ttk.Button(
-            toolbar, text='×', width=1, command=self._on_close)
-        close_btn.pack(side=tk.RIGHT, padx=(4, 0))
-
         # ── Treeview ──
         tree_frame = ttk.Frame(self)
         tree_frame.grid(row=2, column=0, sticky='nsew', padx=4, pady=2)

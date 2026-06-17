@@ -102,6 +102,8 @@ class EditorWidget(tk.Frame):
         self._modified = False
         self._line_numbers_visible = True
         self._sidebar_width = None
+        self._breakpoints: set[int] = set()  # line numbers with breakpoints
+        self._file_path = None               # set externally by tab
         self._build_ui()
 
     # ── UI construction ───────────────────────────────────────────────────
@@ -118,6 +120,8 @@ class EditorWidget(tk.Frame):
         )
         self._line_text.config(state=tk.DISABLED)
         self._line_text.tag_config('linenumber', justify=tk.RIGHT)
+        self._line_text.tag_config('breakpoint', foreground='#d32f2f',
+                                    font=('Monaco', 10, 'bold'))
         self._line_text.insert('end', '1', 'linenumber')
         # Prepare for grid; show_sidebar / hide_sidebar manage visibility
         self._prev_end = 1
@@ -272,7 +276,8 @@ class EditorWidget(tk.Frame):
         # Redirect right-click
         lt.bind('<Button-2>', self._sidebar_button_redirect)
         lt.bind('<Button-3>', self._sidebar_button_redirect)
-        lt.bind('<Control-Button-1>', self._sidebar_button_redirect)
+        # Ctrl/Cmd+Click on sidebar: toggle breakpoint
+        lt.bind('<Control-Button-1>', self._sidebar_toggle_breakpoint)
 
         # Line selection by drag on sidebar
         self._sidebar_drag_start = None
@@ -325,6 +330,12 @@ class EditorWidget(tk.Frame):
         """Redirect mouse buttons (right-click, etc.) to main text."""
         self._text.focus_set()
         self._text.event_generate(f'<Button-{event.num}>', x=0, y=event.y)
+        return 'break'
+
+    def _sidebar_toggle_breakpoint(self, event):
+        """Ctrl/Cmd+Click on sidebar: toggle breakpoint on that line."""
+        lineno = self._sidebar_lineno_at_y(event.y)
+        self.toggle_breakpoint(lineno)
         return 'break'
 
     # ── Sidebar line selection ────────────────────────────────────────────
@@ -439,6 +450,22 @@ class EditorWidget(tk.Frame):
             self._line_text.config(state=tk.DISABLED)
 
         self._prev_end = end
+        self._redraw_breakpoint_markers()
+
+    def _redraw_breakpoint_markers(self):
+        """Redraw breakpoint markers in the line-number sidebar."""
+        self._line_text.config(state=tk.NORMAL)
+        try:
+            # Clear all breakpoint tags from sidebar
+            self._line_text.tag_remove('breakpoint', '1.0', 'end')
+            # Add breakpoint markers
+            for lineno in self._breakpoints:
+                if 1 <= lineno <= self._prev_end:
+                    line_start = f'{lineno}.0'
+                    self._line_text.tag_add('breakpoint', line_start,
+                                            f'{line_start} lineend')
+        finally:
+            self._line_text.config(state=tk.DISABLED)
 
     # ── Smart key handlers ────────────────────────────────────────────────
 
@@ -579,6 +606,37 @@ class EditorWidget(tk.Frame):
 
     def set_saved(self):
         self._undo.set_saved(1)
+
+    # ── Breakpoints ────────────────────────────────────────────────────────
+
+    def toggle_breakpoint(self, lineno=None):
+        """Toggle a breakpoint on the given line (or current cursor line).
+
+        Returns True if breakpoint was added, False if removed.
+        """
+        if lineno is None:
+            lineno = _get_lineno(self._text, 'insert')
+        if lineno in self._breakpoints:
+            self._breakpoints.discard(lineno)
+            self._redraw_breakpoint_markers()
+            return False
+        else:
+            self._breakpoints.add(lineno)
+            self._redraw_breakpoint_markers()
+            return True
+
+    def has_breakpoint(self, lineno):
+        """Check if a breakpoint exists on the given line."""
+        return lineno in self._breakpoints
+
+    def get_breakpoints(self):
+        """Return the set of breakpoint line numbers."""
+        return self._breakpoints.copy()
+
+    def clear_all_breakpoints(self):
+        """Remove all breakpoints from this editor."""
+        self._breakpoints.clear()
+        self._redraw_breakpoint_markers()
 
     def flash_paren(self):
         """Highlight surrounding brackets (menu / shortcut entry point)."""

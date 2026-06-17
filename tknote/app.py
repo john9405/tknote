@@ -90,6 +90,9 @@ class MarkdownEditor:
         self.editor_context_menu.add_command(label="Paste", command=self.paste)
         self.editor_context_menu.add_separator()
         self.editor_context_menu.add_command(label="Select All", command=self.select_all)
+        self.editor_context_menu.add_separator()
+        self.editor_context_menu.add_command(label="Toggle Breakpoint",
+                                             command=self._toggle_breakpoint)
 
         # -- Main layout --
         main_frame = ttk.Frame(self.root)
@@ -274,12 +277,18 @@ class MarkdownEditor:
         cwd = os.path.expanduser('~')
         self._shell_panel = PythonShell(editor_paned)
         self._shell_panel.set_close_callback(self._toggle_shell)
+        self._shell_panel._open_source_callback = self._on_debug_source
 
         self._pkg_panel = PackageManager(editor_paned)
         self._pkg_panel.set_close_callback(self._toggle_packages)
 
         self._sys_term = SystemTerminal(editor_paned, cwd=cwd)
         self._sys_term.set_close_callback(self._toggle_terminal)
+
+        # Debugger panel (hidden by default)
+        from .debugger import Debugger
+        self._debug_panel = Debugger(editor_paned, self._shell_panel)
+        self._debug_panel.set_close_callback(self._toggle_debugger)
 
         # -- Status bar --
         status_frame = ttk.Frame(self.root)
@@ -316,7 +325,12 @@ class MarkdownEditor:
         self._terminal_status.pack(side=tk.RIGHT)
         self._terminal_status.bind(
             '<Button-1>', lambda e: self._toggle_terminal())
-
+        # Right: debug toggle
+        self._debug_status = ttk.Label(
+            status_frame, text='🐞 Debug', relief=tk.SUNKEN,
+            cursor='hand2', padding=(6, 1))
+        self._debug_status.pack(side=tk.RIGHT)
+        self._debug_status.bind('<Button-1>', lambda e: self._toggle_debugger())
         # Right: python shell entry
         self._shell_status = ttk.Label(
             status_frame, text='▶ Shell', relief=tk.SUNKEN,
@@ -374,7 +388,8 @@ class MarkdownEditor:
             self.editor_paned.forget(panel)
             return False
         # Hide any other visible bottom panel
-        for p in [self._shell_panel, self._pkg_panel, self._sys_term]:
+        for p in [self._shell_panel, self._pkg_panel, self._sys_term,
+                   self._debug_panel]:
             if p is not panel and p.winfo_ismapped():
                 self.editor_paned.forget(p)
         self.editor_paned.add(panel, weight=1)
@@ -413,6 +428,77 @@ class MarkdownEditor:
         """Show the Packages panel (called from status bar)."""
         if not self._pkg_panel.winfo_ismapped():
             self._toggle_packages()
+
+    # ---- Debugger ----------------------------------------------------------
+
+    def _toggle_debugger(self):
+        """Toggle the debugger panel and debug mode on/off."""
+        visible = self._show_bottom_panel(self._debug_panel)
+        if visible:
+            self._shell_panel.open_debugger(self._debug_panel)
+            self._debug_status.configure(text='⏹ Debug')
+            self.status_bar.configure(text='Debugger ON — run code in Shell to debug')
+            # Load breakpoints from all open editors
+            self._load_breakpoints_to_debugger()
+        else:
+            self._shell_panel.close_debugger()
+            self._debug_status.configure(text='🐞 Debug')
+            self.status_bar.configure(text='Debugger OFF')
+
+    def _toggle_breakpoint(self):
+        """Toggle a breakpoint on the current cursor line in the active editor."""
+        editor = self.editor
+        if editor is None:
+            return
+        lineno = int(float(editor.index('insert')))
+        added = editor.toggle_breakpoint(lineno)
+        if added:
+            self.status_bar.configure(text=f'Breakpoint set at line {lineno}')
+        else:
+            self.status_bar.configure(text=f'Breakpoint cleared at line {lineno}')
+        # Sync breakpoints to debugger if active
+        self._sync_breakpoint_to_debugger(editor, lineno, added)
+
+    def _load_breakpoints_to_debugger(self):
+        """Load all breakpoints from open editors into the debugger."""
+        dbg = self._shell_panel.get_debugger()
+        if dbg is None:
+            return
+        for tab in self.tabbed_editor._tabs:
+            editor = tab['editor']
+            file_path = tab.get('file_path')
+            if file_path and os.path.isfile(file_path):
+                for lineno in editor.get_breakpoints():
+                    dbg.set_breakpoint(file_path, lineno)
+
+    def _sync_breakpoint_to_debugger(self, editor, lineno, added):
+        """Sync a single breakpoint change to the debugger."""
+        dbg = self._shell_panel.get_debugger()
+        if dbg is None:
+            return
+        tab = self.tabbed_editor.get_active_tab()
+        if not tab or not tab.get('file_path'):
+            return
+        file_path = tab['file_path']
+        if os.path.isfile(file_path):
+            if added:
+                dbg.set_breakpoint(file_path, lineno)
+            else:
+                dbg.clear_breakpoint(file_path, lineno)
+
+    def _on_debug_source(self, filename, lineno):
+        """Open a file and jump to a specific line (called by debugger)."""
+        self._open_file_in_tab(filename)
+        editor = self.editor
+        if editor:
+            editor.mark_set('insert', f'{lineno}.0')
+            editor.see(f'{lineno}.0')
+            # Highlight the line
+            editor.tag_remove('debug_line', '1.0', 'end')
+            editor.tag_add('debug_line', f'{lineno}.0', f'{lineno}.0 lineend')
+            editor.tag_config('debug_line', background='#ffeb3b')
+            # Remove highlight after 2 seconds
+            self.root.after(2000, lambda: editor.tag_remove('debug_line', '1.0', 'end'))
 
     def _on_window_close(self):
         """Clean up subprocesses before closing."""
