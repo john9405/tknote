@@ -18,7 +18,7 @@ from .git_ops import run_git_command
 class MarkdownEditor:
     def __init__(self, root):
         self.root = root
-        self.root.title("Markdown Editor")
+        self.root.title("IDLE")
         self.root.geometry("1200x700")
 
         self.current_folder = None
@@ -95,45 +95,27 @@ class MarkdownEditor:
         main_frame = ttk.Frame(self.root)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        # ---- Activity Bar (far left) ----
-        self.activity_bar = tk.Canvas(
-            main_frame, width=48, bg='#ececec', highlightthickness=0
-        )
-        self.activity_bar.pack(side=tk.LEFT, fill=tk.Y)
-
-        self._activity_items = {}
-        # Files button
-        fid = self.activity_bar.create_text(
-            24, 16, text='📁', font=('Helvetica', 18),
-            anchor='n', fill='#ffffff'
-        )
-        self._activity_items['files'] = fid
-        self.activity_bar.tag_bind(fid, '<Button-1>', lambda e: self._switch_activity('files'))
-
-        # Git button
-        gid = self.activity_bar.create_text(
-            24, 56, text='🔀', font=('Helvetica', 18),
-            anchor='n', fill='#888888'
-        )
-        self._activity_items['git'] = gid
-        self.activity_bar.tag_bind(gid, '<Button-1>', lambda e: self._switch_activity('git'))
-
-        self._active_activity = 'files'
-
-        # ---- PanedWindow: sidebar + editor ----
+        # ---- PanedWindow: primary sidebar + main area + auxiliary sidebar ----
         paned = ttk.PanedWindow(main_frame, orient=tk.HORIZONTAL)
         paned.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.main_paned = paned
 
-        # ---- Sidebar ----
-        sidebar_frame = ttk.Frame(paned)
+        # ---- Primary sidebar / Main area / Auxiliary sidebar ----
+        primary_sidebar_frame = ttk.Frame(paned, width=260)
         editor_paned = ttk.PanedWindow(paned, orient=tk.VERTICAL)
+        auxiliary_sidebar_frame = ttk.Frame(paned, width=320)
+        primary_sidebar_frame.pack_propagate(False)
+        auxiliary_sidebar_frame.pack_propagate(False)
 
-        paned.add(sidebar_frame, weight=0)
+        paned.add(primary_sidebar_frame, weight=0)
         paned.add(editor_paned, weight=1)
+        self.primary_sidebar_frame = primary_sidebar_frame
+        self.auxiliary_sidebar_frame = auxiliary_sidebar_frame
+        self._auxiliary_sidebar_visible = False
         self.editor_paned = editor_paned
 
-        # -- File tree panel (inside sidebar) --
-        self.file_tree_frame = ttk.Frame(sidebar_frame)
+        # -- File tree panel (inside primary sidebar) --
+        self.file_tree_frame = ttk.Frame(primary_sidebar_frame)
 
         tree_header = ttk.Frame(self.file_tree_frame)
         tree_header.pack(fill=tk.X)
@@ -169,12 +151,30 @@ class MarkdownEditor:
         self.context_menu.add_separator()
         self.context_menu.add_command(label="Delete", command=self.delete_selected)
 
-        # -- Git panel (inside sidebar) --
-        self.git_panel_frame = ttk.Frame(sidebar_frame)
+        # -- Git panel (inside auxiliary sidebar) --
+        self.git_panel_frame = ttk.Frame(auxiliary_sidebar_frame)
 
         git_header = ttk.Frame(self.git_panel_frame)
         git_header.pack(fill=tk.X, padx=5, pady=5)
         ttk.Label(git_header, text="Source Control", font=("Helvetica", 10, "bold")).pack(side=tk.LEFT)
+
+        git_header_actions = ttk.Frame(git_header)
+        git_header_actions.pack(side=tk.RIGHT)
+
+        self._status_branch_label = ttk.Label(
+            git_header_actions, text="⎇ no repo", font=("Helvetica", 10))
+        self._status_branch_label.pack(side=tk.LEFT, padx=(0, 6))
+        self._status_branch_label.bind('<Button-1>', self._show_branch_popup)
+
+        self._status_push_btn = ttk.Button(
+            git_header_actions, text="↑", command=self.git_push, width=1,
+            state=tk.DISABLED)
+        self._status_push_btn.pack(side=tk.LEFT, padx=1)
+
+        self._status_pull_btn = ttk.Button(
+            git_header_actions, text="↓", command=self.git_pull, width=1,
+            state=tk.DISABLED)
+        self._status_pull_btn.pack(side=tk.LEFT, padx=1)
 
         # ---- Top buttons: repository setup (conditional) + commit area ----
         git_btn_frame = ttk.Frame(self.git_panel_frame)
@@ -200,11 +200,9 @@ class MarkdownEditor:
         self._commit_msg_entry.bind('<FocusIn>', self._on_commit_msg_focus_in)
         self._commit_msg_entry.bind('<FocusOut>', self._on_commit_msg_focus_out)
 
-        # Row 3: commit + push buttons
+        # Row 3: commit
         self._git_btns['commit'] = ttk.Button(git_btn_frame, text="Commit", command=self.git_commit)
-        self._git_btns['commit'].grid(row=3, column=0, padx=1, pady=1, sticky='ew')
-        self._git_btns['push_panel'] = ttk.Button(git_btn_frame, text="Push", command=self.git_push)
-        self._git_btns['push_panel'].grid(row=3, column=1, padx=1, pady=1, sticky='ew')
+        self._git_btns['commit'].grid(row=3, column=0, columnspan=2, padx=1, pady=1, sticky='ew')
 
         git_btn_frame.columnconfigure(0, weight=1)
         git_btn_frame.columnconfigure(1, weight=1)
@@ -221,7 +219,7 @@ class MarkdownEditor:
         git_status_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
         self.git_status_text = tk.Text(
-            git_status_frame, height=8, font=("Monaco", 10),
+            git_status_frame, width=36, height=8, font=("Monaco", 10),
             yscrollcommand=git_status_scroll.set, state=tk.DISABLED,
             cursor='hand2'
         )
@@ -252,14 +250,15 @@ class MarkdownEditor:
         log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
         self._git_log_text = tk.Text(
-            log_frame, height=6, font=("Monaco", 10),
+            log_frame, width=36, height=6, font=("Monaco", 10),
             yscrollcommand=log_scroll.set, state=tk.DISABLED
         )
         self._git_log_text.pack(fill=tk.BOTH, expand=True)
         log_scroll.config(command=self._git_log_text.yview)
 
-        # Show file tree by default
+        # Show sidebars by default
         self.file_tree_frame.pack(fill=tk.BOTH, expand=True)
+        self.git_panel_frame.pack(fill=tk.BOTH, expand=True)
 
         # -- Tabbed editor --
         self.tabbed_editor = TabbedEditor(
@@ -286,26 +285,6 @@ class MarkdownEditor:
         status_frame = ttk.Frame(self.root)
         status_frame.pack(fill=tk.X, side=tk.BOTTOM, padx=8)
 
-        # Left: git info frame (branch name + push + pull; always visible, disabled when no repo)
-        self._status_git_frame = ttk.Frame(status_frame)
-
-        self._status_branch_label = ttk.Label(
-            self._status_git_frame, text="⎇ no repo", font=("Helvetica", 10))
-        self._status_branch_label.pack(side=tk.LEFT, padx=(0, 8))
-        self._status_branch_label.bind('<Button-1>', self._show_branch_popup)
-
-        self._status_push_btn = ttk.Button(
-            self._status_git_frame, text="↑", command=self.git_push, width=1,
-            state=tk.DISABLED)
-        self._status_push_btn.pack(side=tk.LEFT, padx=1)
-
-        self._status_pull_btn = ttk.Button(
-            self._status_git_frame, text="↓", command=self.git_pull, width=1,
-            state=tk.DISABLED)
-        self._status_pull_btn.pack(side=tk.LEFT, padx=(1, 8))
-
-        self._status_git_frame.pack(side=tk.LEFT)
-
         # Center: status text
         self.status_bar = ttk.Label(
             status_frame, text="Ready", relief=tk.SUNKEN, anchor='w')
@@ -322,6 +301,13 @@ class MarkdownEditor:
             cursor='hand2', padding=(6, 1))
         self._venv_status.pack(side=tk.LEFT)
         self._venv_status.bind('<Button-1>', lambda e: self._show_venv_popup())
+
+        # Right: source control panel toggle
+        self._git_panel_status = ttk.Label(
+            status_frame, text='Source Control', relief=tk.SUNKEN,
+            cursor='hand2', padding=(6, 1))
+        self._git_panel_status.pack(side=tk.RIGHT)
+        self._git_panel_status.bind('<Button-1>', lambda e: self._toggle_auxiliary_sidebar())
 
         # Right: terminal toggle
         self._terminal_status = ttk.Label(
@@ -346,6 +332,7 @@ class MarkdownEditor:
         self._pkg_status.bind('<Button-1>', lambda e: self._toggle_packages())
         # Update status bar widget references
         self._status_frame = status_frame
+        self._refresh_git_panel()
 
     # ---- Shortcut binding for new editors ----------------------------------
 
@@ -602,24 +589,31 @@ class MarkdownEditor:
 
         self.tabbed_editor.close_tab(self.tabbed_editor.get_tab_index(tab_id))
 
-    # ---- Activity bar / Sidebar switching ------------------------------------
+    # ---- Auxiliary sidebar switching ---------------------------------------
 
-    def _switch_activity(self, activity):
-        """Switch the sidebar between 'files' and 'git' views."""
-        self._active_activity = activity
-        # Update activity bar button colors
-        for name, item_id in self._activity_items.items():
-            self.activity_bar.itemconfig(
-                item_id, fill='#ffffff' if name == activity else '#888888'
-            )
-        # Swap sidebar content
-        if activity == 'files':
-            self.git_panel_frame.pack_forget()
-            self.file_tree_frame.pack(fill=tk.BOTH, expand=True)
+    def _show_auxiliary_sidebar(self):
+        """Show the auxiliary sidebar that hosts the git panel."""
+        if not self._auxiliary_sidebar_visible:
+            self.main_paned.add(self.auxiliary_sidebar_frame, weight=0)
+            self._auxiliary_sidebar_visible = True
+        self._git_panel_status.config(text='Source Control')
+        self._refresh_git_panel()
+
+    def _hide_auxiliary_sidebar(self):
+        """Hide the auxiliary sidebar."""
+        if self._auxiliary_sidebar_visible:
+            self.main_paned.forget(self.auxiliary_sidebar_frame)
+            self._auxiliary_sidebar_visible = False
+        self._git_panel_status.config(text='Source Control')
+
+    def _toggle_auxiliary_sidebar(self):
+        """Toggle the auxiliary sidebar from the status bar."""
+        if self._auxiliary_sidebar_visible:
+            self._hide_auxiliary_sidebar()
+            self.status_bar.config(text="Source Control hidden")
         else:
-            self.file_tree_frame.pack_forget()
-            self.git_panel_frame.pack(fill=tk.BOTH, expand=True)
-            self._refresh_git_panel()
+            self._show_auxiliary_sidebar()
+            self.status_bar.config(text="Source Control shown")
 
     def _refresh_git_panel(self):
         """Update the git panel with current branch, status, and log."""
@@ -785,15 +779,13 @@ class MarkdownEditor:
         else:
             self._git_btns['remote'].grid_remove()
 
-        # Commit msg entry, commit button, push button: visible when folder is open
+        # Commit msg entry, commit button: visible when folder is open
         if folder_open and has_git:
             self._commit_msg_entry.grid()
             self._git_btns['commit'].grid()
-            self._git_btns['push_panel'].grid()
         else:
             self._commit_msg_entry.grid_remove()
             self._git_btns['commit'].grid_remove()
-            self._git_btns['push_panel'].grid_remove()
 
     # ---- File opening helpers ----------------------------------------------
 
@@ -1065,7 +1057,7 @@ class MarkdownEditor:
 
     def show_new_menu(self):
         if not self.current_folder:
-            self.status_bar.config(text="No folder opened")
+            self.new_file()
             return
 
         menu = tk.Menu(self.root, tearoff=0)
@@ -1083,7 +1075,7 @@ class MarkdownEditor:
 
     def new_file_in_tree(self):
         if not self.current_folder:
-            self.status_bar.config(text="No folder opened")
+            self.new_file()
             return
 
         parent_path = self.get_selected_path()
