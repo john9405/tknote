@@ -2,6 +2,7 @@
 
 import os
 import re
+import shlex
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
@@ -839,7 +840,7 @@ class MarkdownEditor:
 
             # cd to directory and run
             self._sys_term.cd_to(dir_name)
-            self._sys_term.send_command(f'python3 "{file_name}"')
+            self._sys_term.send_command(f'python3 -- {shlex.quote(file_name)}')
             try:
                 self.status_bar.config(text=f"Running in Terminal: {file_name}")
             except tk.TclError:

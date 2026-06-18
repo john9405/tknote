@@ -150,12 +150,21 @@ class PackageManager(ttk.Frame):
 
     # ── pip command execution ────────────────────────────────────────────────
 
-    def _run_pip(self, args: list[str], callback=None):
+    def _run_pip(
+        self,
+        args: list[str],
+        callback=None,
+        *,
+        show_command: bool = True,
+        status_text: str | None = None,
+    ):
         """Run a pip command in a background thread.
 
         Args:
             args: pip arguments (without 'pip' itself), e.g. ['list', '--format=json'].
             callback: Optional callback(result) on success; result is the CompletedProcess.
+            show_command: Whether to echo the pip command in the output area.
+            status_text: Optional status text to show while the command runs.
         """
         if self._busy:
             self._show_output('[busy] Another operation is in progress.\n', 'stderr')
@@ -165,8 +174,9 @@ class PackageManager(ttk.Frame):
         cmd = [python, '-m', 'pip'] + args
         self._busy = True
         self._update_button_states()
-        self._status.config(text=f'Running: pip {" ".join(args)}')
-        self._show_output(f'$ pip {" ".join(args)}\n', 'stdout')
+        self._status.config(text=status_text or f'Running: pip {" ".join(args)}')
+        if show_command:
+            self._show_output(f'$ pip {" ".join(args)}\n', 'stdout')
 
         def target():
             try:
@@ -269,7 +279,12 @@ class PackageManager(ttk.Frame):
             self._status.config(text=f'Installed: {name}')
             self._refresh()
 
-        self._run_pip(['install', name], callback=on_done)
+        self._run_pip(
+            ['install', name],
+            callback=on_done,
+            show_command=False,
+            status_text=f'Installing {name}...',
+        )
 
     def _uninstall_package(self):
         """Uninstall the selected package(s)."""

@@ -14,6 +14,8 @@ import fcntl
 import os
 import pty
 import select
+import shlex
+import shutil
 import signal
 import struct
 import subprocess
@@ -66,11 +68,118 @@ _BG_PALETTE = {
     107: '#ffffff',
 }
 
+
+_CSI_FINALS = frozenset('@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~')
+_OSC_TERMINATORS = ('\x07', '\x1b\\')
+
+
 # Map ANSI code → tag name suffix
 def _make_tag_name(code, is_bg):
     if is_bg:
         return f'ansi_bg_{code}'
     return f'ansi_fg_{code}'
+
+
+class _TerminalControlParser:
+    """Strip terminal controls that a tkinter Text terminal cannot render.
+
+    SGR colour CSI sequences are intentionally preserved for _AnsiParser.
+    Other controls used by zsh prompts, bracketed paste, title updates and
+    cursor mode toggles are consumed here, including sequences split across
+    PTY reads.
+    """
+
+    _MAX_PENDING = 8192
+
+    def __init__(self):
+        self._pending = ''
+        self.bracketed_paste = False
+
+    def feed(self, data: str) -> str:
+        if self._pending:
+            data = self._pending + data
+            self._pending = ''
+
+        out: list[str] = []
+        i = 0
+        n = len(data)
+
+        while i < n:
+            ch = data[i]
+            if ch != '\x1b':
+                out.append(ch)
+                i += 1
+                continue
+
+            if i + 1 >= n:
+                self._pending = data[i:]
+                break
+
+            nxt = data[i + 1]
+            if nxt == '[':
+                end = self._find_csi_end(data, i + 2)
+                if end is None:
+                    self._stash_pending(data[i:])
+                    break
+                seq = data[i:end + 1]
+                if self._is_bracketed_paste_mode(seq):
+                    self.bracketed_paste = seq.endswith('h')
+                elif seq.endswith('m') or seq.endswith('K') or seq.endswith('J'):
+                    out.append(seq)
+                i = end + 1
+                continue
+
+            if nxt == ']':
+                end = self._find_osc_end(data, i + 2)
+                if end is None:
+                    self._stash_pending(data[i:])
+                    break
+                i = end
+                continue
+
+            if nxt in ('P', '^', '_'):
+                end = data.find('\x1b\\', i + 2)
+                if end < 0:
+                    self._stash_pending(data[i:])
+                    break
+                i = end + 2
+                continue
+
+            if nxt in '()*+-./':
+                if i + 2 >= n:
+                    self._stash_pending(data[i:])
+                    break
+                i += 3
+                continue
+
+            # Two-byte escape controls such as ESC c / ESC 7 / ESC 8.
+            i += 2
+
+        return ''.join(out)
+
+    def _stash_pending(self, text: str):
+        # Avoid unbounded memory if a program emits a malformed control string.
+        self._pending = '' if len(text) > self._MAX_PENDING else text
+
+    def _find_csi_end(self, data: str, start: int) -> Optional[int]:
+        for j in range(start, len(data)):
+            if data[j] in _CSI_FINALS:
+                return j
+        return None
+
+    def _find_osc_end(self, data: str, start: int) -> Optional[int]:
+        bell = data.find(_OSC_TERMINATORS[0], start)
+        st = data.find(_OSC_TERMINATORS[1], start)
+        if bell < 0 and st < 0:
+            return None
+        if bell < 0:
+            return st + 2
+        if st < 0:
+            return bell + 1
+        return min(bell + 1, st + 2)
+
+    def _is_bracketed_paste_mode(self, seq: str) -> bool:
+        return seq in ('\x1b[?2004h', '\x1b[?2004l')
 
 
 class _AnsiParser:
@@ -83,8 +192,9 @@ class _AnsiParser:
     Tags are tkinter tag names already configured on the Text widget.
     """
 
-    # Sentinel inserted into the segment stream to mark \x1b[K (erase line)
+    # Sentinels inserted into the segment stream for terminal erase controls.
     _ERASE_LINE = object()
+    _CLEAR_SCREEN = object()
 
     def __init__(self, text_widget: tk.Text):
         self._w = text_widget
@@ -152,6 +262,7 @@ class _AnsiParser:
         Returns a list where each element is either:
           - (text: str, tags: tuple) — insert with given tags
           - _ERASE_LINE — clear from cursor to end of current line
+          - _CLEAR_SCREEN — clear the rendered terminal buffer
         """
         segments: list = []
         i = 0
@@ -169,7 +280,7 @@ class _AnsiParser:
                 i += 2
                 # Collect parameter bytes
                 j = i
-                while j < n and data[j] not in '@-~':
+                while j < n and data[j] not in _CSI_FINALS:
                     j += 1
                 if j >= n:
                     # Incomplete sequence — treat \x1b[ as text
@@ -193,6 +304,8 @@ class _AnsiParser:
                         self._apply_sgr(0)
                 elif final == 'K' and params_str in ('', '0'):
                     segments.append(self._ERASE_LINE)
+                elif final == 'J' and self._is_full_display_erase(params_str):
+                    segments.append(self._CLEAR_SCREEN)
                 # All other CSI sequences: silently dropped
             else:
                 buf.append(data[i])
@@ -203,17 +316,24 @@ class _AnsiParser:
         # Merge adjacent text segments with identical tags
         merged: list = []
         for item in segments:
-            if item is self._ERASE_LINE:
+            if item in (self._ERASE_LINE, self._CLEAR_SCREEN):
                 merged.append(item)
             else:
                 text, tags = item
-                if merged and merged[-1] is not self._ERASE_LINE:
+                if merged and merged[-1] not in (self._ERASE_LINE, self._CLEAR_SCREEN):
                     prev = merged[-1]
                     if prev[1] == tags:
                         merged[-1] = (prev[0] + text, tags)
                         continue
                 merged.append(item)
         return merged
+
+    def _is_full_display_erase(self, params_str: str) -> bool:
+        try:
+            params = [int(p) if p else 0 for p in params_str.split(';')]
+        except ValueError:
+            return False
+        return bool(params and params[0] in (2, 3))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -267,6 +387,7 @@ class SystemTerminal(ttk.Frame):
         # Pending output buffer (batch accumulated reads before UI dispatch)
         self._pending_output: list[str] = []
         self._output_scheduled = False
+        self._control = _TerminalControlParser()
 
         self._build_ui()
         self._start_shell()
@@ -422,8 +543,38 @@ class SystemTerminal(ttk.Frame):
 
     # ── PTY / Shell process ───────────────────────────────────────────────────
 
+    def _resolve_shell(self) -> str:
+        candidates = [
+            os.environ.get('SHELL'),
+            '/bin/zsh',
+            shutil.which('zsh'),
+            '/bin/bash',
+            shutil.which('bash'),
+            '/bin/sh',
+        ]
+        seen: set[str] = set()
+        for candidate in candidates:
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            shell = candidate if os.path.isabs(candidate) else shutil.which(candidate)
+            if shell and os.path.isfile(shell) and os.access(shell, os.X_OK):
+                return shell
+        return '/bin/sh'
+
+    def _shell_argv(self, shell: str) -> tuple[list[str], Optional[str]]:
+        name = os.path.basename(shell)
+        if name == 'zsh':
+            # Match macOS Terminal's login-shell behavior so ~/.zprofile and
+            # ~/.zshrc are both loaded for zsh users.
+            return [f'-{name}', '-i'], shell
+        return [shell, '-i'], None
+
     def _start_shell(self):
-        shell = os.environ.get('SHELL', '/bin/zsh')
+        shell = self._resolve_shell()
+        shell_argv, executable = self._shell_argv(shell)
+        env = self._build_shell_env(shell)
+        self._control = _TerminalControlParser()
         try:
             master_fd, slave_fd = pty.openpty()
         except OSError:
@@ -438,16 +589,18 @@ class SystemTerminal(ttk.Frame):
             pass
 
         try:
-            self._shell_proc = subprocess.Popen(
-                [shell, '-i'],
-                stdin=slave_fd,
-                stdout=slave_fd,
-                stderr=slave_fd,
-                cwd=self._cwd,
-                preexec_fn=os.setsid,
-                env=self._build_shell_env(),
-                close_fds=True,
-            )
+            popen_kwargs = {
+                'stdin': slave_fd,
+                'stdout': slave_fd,
+                'stderr': slave_fd,
+                'cwd': self._cwd,
+                'preexec_fn': os.setsid,
+                'env': env,
+                'close_fds': True,
+            }
+            if executable is not None:
+                popen_kwargs['executable'] = executable
+            self._shell_proc = subprocess.Popen(shell_argv, **popen_kwargs)
         except Exception as e:
             self._append_shell_output(f'[Error: {e}]\n')
             os.close(master_fd)
@@ -491,6 +644,9 @@ class SystemTerminal(ttk.Frame):
             pass
 
         # ── Preprocess raw text ──────────────────────────────────────────
+        text = self._control.feed(text)
+        if not text:
+            return
         # \r\n → \n  (standard CRLF line ending)
         text = text.replace('\r\n', '\n')
 
@@ -533,6 +689,11 @@ class SystemTerminal(ttk.Frame):
         try:
             # ── Build a flat list of (action, ...) to minimise tk calls ──
             for item in segments:
+                if item is _AnsiParser._CLEAR_SCREEN:
+                    w.delete('1.0', tk.END)
+                    w.mark_set('insert', 'end-1c')
+                    continue
+
                 if item is _AnsiParser._ERASE_LINE:
                     line_start = w.index('insert linestart')
                     line_end = w.index('insert lineend')
@@ -719,7 +880,10 @@ class SystemTerminal(ttk.Frame):
         except tk.TclError:
             return "break"
         if clip:
-            self._write_pty(clip.encode('utf-8'))
+            data = clip.replace('\r\n', '\n').encode('utf-8')
+            if self._control.bracketed_paste:
+                data = b'\x1b[200~' + data + b'\x1b[201~'
+            self._write_pty(data)
         return "break"
 
     def _has_selection(self):
@@ -767,7 +931,7 @@ class SystemTerminal(ttk.Frame):
             self._stop_shell()
             self._start_shell()
 
-    def _build_shell_env(self) -> dict:
+    def _build_shell_env(self, shell_path: Optional[str] = None) -> dict:
         """Build the environment dict for the shell subprocess.
 
         When a venv path is configured, VIRTUAL_ENV is set and the venv's
@@ -775,10 +939,14 @@ class SystemTerminal(ttk.Frame):
         virtual environment already active — no need to ``source activate``.
         """
         env = {**os.environ}
+        if shell_path:
+            env['SHELL'] = shell_path
         # Use xterm-256color so programs emit SGR colour codes
         env['TERM'] = 'xterm-256color'
         # Some programs check COLORTERM for true-colour support
         env['COLORTERM'] = 'truecolor'
+        env['TERM_PROGRAM'] = 'tknote'
+        env['TERM_PROGRAM_VERSION'] = '1.0'
         if self._venv_path:
             bin_dir = os.path.join(self._venv_path, 'bin')
             activate_script = os.path.join(bin_dir, 'activate')
@@ -819,8 +987,7 @@ class SystemTerminal(ttk.Frame):
         fd = self._shell_master_fd
         if fd is not None:
             try:
-                escaped = path.replace("'", "'\\''")
-                os.write(fd, f"cd '{escaped}'\n".encode('utf-8'))
+                os.write(fd, f"cd {shlex.quote(path)}\n".encode('utf-8'))
             except OSError:
                 pass
 
