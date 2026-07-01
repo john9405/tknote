@@ -103,8 +103,6 @@ class FileTreePanel(ttk.Frame):
                 for item in items:
                     full = os.path.join(path, item)
                     if os.path.isdir(full):
-                        if item.startswith('.'):
-                            continue
                         nid = self._tree.insert(
                             parent_id, "end", text=f"📁 {item}",
                             values=(full,), tags=("dir",), open=False)
