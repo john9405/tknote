@@ -1,6 +1,6 @@
 """VenvManager — detect, create, activate Python virtual environments.
 
-Persists the active venv path to .note/settings.json in the project root
+Persists the active venv path to .idlerc/settings.json in the project root
 so the choice survives across sessions.
 """
 
@@ -37,7 +37,7 @@ class VenvManager:
     def set_folder(self, folder_path: str | None):
         """Called when a project folder is opened or closed.
 
-        On open: loads venv path from .note/settings.json.
+        On open: loads venv path from .idlerc/settings.json.
         On close (None): clears all state.
         """
         self._current_folder = folder_path
@@ -49,13 +49,13 @@ class VenvManager:
     # ── Settings persistence ────────────────────────────────────────────────
 
     def _settings_file(self) -> str | None:
-        """Return the path to .note/settings.json, or None if no folder is open."""
+        """Return the path to .idlerc/settings.json, or None if no folder is open."""
         if not self._current_folder:
             return None
-        return os.path.join(self._current_folder, '.note', 'settings.json')
+        return os.path.join(self._current_folder, '.idlerc', 'settings.json')
 
     def _load_settings(self):
-        """Read .note/settings.json and activate the stored venv if it exists."""
+        """Read .idlerc/settings.json and activate the stored venv if it exists."""
         path = self._settings_file()
         if not path or not os.path.isfile(path):
             self._venv_path = None
@@ -76,9 +76,9 @@ class VenvManager:
             self._venv_path = None
 
     def save_settings(self):
-        """Persist the current venv path to .note/settings.json.
+        """Persist the current venv path to .idlerc/settings.json.
 
-        Creates the .note directory if it doesn't exist.
+        Creates the .idlerc directory if it doesn't exist.
         Preserves other keys already in the settings file.
         """
         path = self._settings_file()
@@ -100,7 +100,7 @@ class VenvManager:
         else:
             data.pop('pythonEnvPath', None)
 
-        # Ensure the .note directory exists
+        # Ensure the .idlerc directory exists
         note_dir = os.path.dirname(path)
         os.makedirs(note_dir, exist_ok=True)
 
