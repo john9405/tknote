@@ -587,22 +587,30 @@ class Debugger(ttk.Frame):
 
     # ── Run ────────────────────────────────────────────────────────────────
 
-    def run(self, source):
+    def run(self, source, filename=None):
         """Run source code under debugger control.
 
         :param source: Python source code string to execute.
+        :param filename: Optional file path used when compiling the source.
+            When provided, breakpoints keyed by this filename will match,
+            enabling breakpoint-based debugging.
         """
         # Handle nested run (e.g., running code while already in debugger)
         if self.nesting_level > 0:
             self._abort_loop()
-            self.root.after(100, lambda: self.run(source))
+            self.root.after(100, lambda: self.run(source, filename))
             return
 
         try:
             self.interacting = True
             # Use the shell's locals so variables persist in the shell
             shell_locals = getattr(self.pyshell, '_locals', {})
-            self.idb.run(source, shell_locals, shell_locals)
+            # Compile with the real filename so breakpoints match
+            if isinstance(source, str):
+                code = compile(source, filename or '<string>', 'exec')
+            else:
+                code = source
+            self.idb.run(code, shell_locals, shell_locals)
         finally:
             self.interacting = False
             self._clear_views()

@@ -84,6 +84,7 @@ class MarkdownEditor:
         run_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Run", menu=run_menu)
         run_menu.add_command(label="Run Module", command=self.run_current_file, accelerator="Cmd+R")
+        run_menu.add_command(label="Debug Module", command=self.debug_module)
         run_menu.add_command(label="Run in Terminal", command=self.run_in_terminal, accelerator="Cmd+Shift+R")
         run_menu.add_separator()
         run_menu.add_command(label="Check Module", command=self.check_module, accelerator="Cmd+Shift+C")
@@ -110,8 +111,10 @@ class MarkdownEditor:
         self.editor_context_menu.add_separator()
         self.editor_context_menu.add_command(label="Select All", command=self.select_all)
         self.editor_context_menu.add_separator()
-        self.editor_context_menu.add_command(label="Toggle Breakpoint",
+        self.editor_context_menu.add_command(label="Set Breakpoint",
                                              command=self._toggle_breakpoint)
+        self.editor_context_menu.add_command(label="Clear Breakpoint",
+                                             command=self._clear_breakpoint)
 
         # -- Main layout --
         main_frame = ttk.Frame(self.root)
@@ -366,6 +369,20 @@ class MarkdownEditor:
             self.status_bar.configure(text=f'Breakpoint cleared at line {lineno}')
         # Sync breakpoints to debugger if active
         self._sync_breakpoint_to_debugger(editor, lineno, added)
+
+    def _clear_breakpoint(self):
+        """Clear a breakpoint on the current cursor line if one exists."""
+        editor = self.editor
+        if editor is None:
+            return
+        lineno = int(float(editor.index('insert')))
+        if editor.has_breakpoint(lineno):
+            editor.toggle_breakpoint(lineno)
+            self.status_bar.configure(text=f'Breakpoint cleared at line {lineno}')
+            # Sync to debugger if active
+            self._sync_breakpoint_to_debugger(editor, lineno, False)
+        else:
+            self.status_bar.configure(text=f'No breakpoint at line {lineno}')
 
     def _load_breakpoints_to_debugger(self):
         """Load all breakpoints from open editors into the debugger."""
@@ -813,6 +830,50 @@ class MarkdownEditor:
             self.status_bar.config(text=f"Ran: {os.path.basename(file_path)}")
         except tk.TclError:
             pass  # widget may have been destroyed by user code
+
+    def debug_module(self):
+        """Debug the current file under the debugger.
+
+        Opens the debugger panel and runs the file in-process so breakpoints
+        and stepping are available.
+        """
+        tab = self.tabbed_editor.get_active_tab()
+        if not tab:
+            self.status_bar.config(text="No file to debug")
+            return
+
+        # Save first (IDLE-style: must save before debugging)
+        if tab['file_path']:
+            if tab['editor'].is_modified():
+                self._save_to_tab(tab)
+            file_path = tab['file_path']
+        else:
+            # Unsaved file — force Save As first
+            if not self.save_file_as():
+                return
+            file_path = tab['file_path']
+
+        source = tab['editor'].get_text()
+
+        # Show the Python shell
+        if not self._shell_panel.winfo_ismapped():
+            self._toggle_shell()
+
+        # Open debugger if not active
+        if not self._shell_panel.is_debugging():
+            self._toggle_debugger()
+
+        try:
+            self.root.update_idletasks()
+        except tk.TclError:
+            pass
+
+        self._shell_panel.run_code_debug(source, file_path=file_path)
+        try:
+            self.status_bar.config(
+                text=f"Debugging: {os.path.basename(file_path)}")
+        except tk.TclError:
+            pass
 
     def run_in_terminal(self):
         """Run the current file in the system terminal."""

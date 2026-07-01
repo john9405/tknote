@@ -519,6 +519,46 @@ class PythonShell(ttk.Frame):
         else:
             self._run_inprocess(source, file_path)
 
+    def run_code_debug(self, source, file_path=None):
+        """Execute Python source under debugger control — always in-process.
+
+        Unlike ``run_code`` which may fork a subprocess for files on disk,
+        this always runs in-process so the debugger can trace execution.
+
+        Parameters
+        ----------
+        source : str
+            The Python source code to execute.
+        file_path : str, optional
+            If provided, the file path is used for sys.path setup and
+            restart banner labelling.
+        """
+        self.restart(file_path)
+
+        label = os.path.basename(file_path) if file_path else '<script>'
+        self.write(f'── Debugging {label} ──\n', 'console')
+
+        # Ensure debugger is active
+        if self._debugger is None:
+            self.open_debugger()
+
+        old_stdout = sys.stdout
+        old_stderr = sys.stderr
+        sys.stdout = _ShellWriter(self, 'stdout')
+        sys.stderr = _ShellWriter(self, 'stderr')
+        try:
+            self._debugger.run(source, filename=file_path)
+        except bdb.BdbQuit:
+            self.write("\n[DEBUG QUIT]\n", 'stderr')
+        except Exception:
+            import traceback
+            traceback.print_exc()
+        finally:
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
+
+        self._emit_completion()
+
     def _run_subprocess(self, file_path, python_exe=None):
         """Launch *file_path* in a subprocess and capture output."""
         self.restart(file_path)
