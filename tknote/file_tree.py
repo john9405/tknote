@@ -61,7 +61,9 @@ class FileTreePanel(ttk.Frame):
         tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
         self._tree = ttk.Treeview(
-            self, yscrollcommand=tree_scroll.set, selectmode="browse")
+            self, yscrollcommand=tree_scroll.set, selectmode="browse",
+            show="tree headings")
+        self._tree.heading("#0", text="Files")
         self._tree.pack(fill=tk.BOTH, expand=True)
         tree_scroll.config(command=self._tree.yview)
 
@@ -93,6 +95,10 @@ class FileTreePanel(ttk.Frame):
 
     def populate(self, folder_path):
         """Rebuild the tree from *folder_path*."""
+        if folder_path and os.path.isdir(folder_path):
+            self._tree.heading("#0", text=f"📂 {os.path.basename(folder_path)}")
+        else:
+            self._tree.heading("#0", text="Files")
         self._tree.delete(*self._tree.get_children())
 
         def _add_items(path, parent_id):
