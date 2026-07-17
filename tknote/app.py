@@ -3,6 +3,7 @@
 import os
 import re
 import shlex
+import textwrap
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
@@ -24,6 +25,8 @@ class MarkdownEditor:
 
         self.current_folder = None
         self.venv_manager = VenvManager()
+        self._last_search_query = ''
+        self._last_search_case = False
         self.setup_ui()
         self.root.protocol('WM_DELETE_WINDOW', self._on_window_close)
 
@@ -57,64 +60,59 @@ class MarkdownEditor:
         edit_menu.add_command(label="Undo", command=self.undo, accelerator="Cmd+Z")
         edit_menu.add_command(label="Redo", command=self.redo, accelerator="Cmd+Shift+Z")
         edit_menu.add_separator()
+        edit_menu.add_command(label="Select All", command=self.select_all, accelerator="Cmd+A")
         edit_menu.add_command(label="Cut", command=self.cut, accelerator="Cmd+X")
         edit_menu.add_command(label="Copy", command=self.copy, accelerator="Cmd+C")
         edit_menu.add_command(label="Paste", command=self.paste, accelerator="Cmd+V")
-        edit_menu.add_command(label="Select All", command=self.select_all, accelerator="Cmd+A")
         edit_menu.add_separator()
-        edit_menu.add_command(label="Bold", command=lambda: self.insert_format("**", "**"), accelerator="Cmd+B")
-        edit_menu.add_command(label="Italic", command=lambda: self.insert_format("*", "*"), accelerator="Cmd+I")
-        edit_menu.add_command(label="Heading", command=self.insert_heading, accelerator="Cmd+H")
-        edit_menu.add_command(label="Link", command=self.insert_link, accelerator="Cmd+K")
-        edit_menu.add_command(label="Code", command=lambda: self.insert_format("`", "`"), accelerator="Cmd+Shift+C")
+        edit_menu.add_command(label="Find...", command=self.show_find_dialog, accelerator="Cmd+F")
+        edit_menu.add_command(label="Find Again", command=self.find_again, accelerator="Cmd+G")
+        edit_menu.add_command(label="Find Selection", command=self.find_selection, accelerator="Cmd+F3")
+        edit_menu.add_command(label="Find in Files...", command=self.show_search_dialog, accelerator="Cmd+Shift+F")
+        edit_menu.add_command(label="Replace...", command=self.show_replace_dialog, accelerator="Cmd+R")
         edit_menu.add_separator()
-        edit_menu.add_command(label="Flash Parens", command=self.flash_paren, accelerator="Cmd+Shift+P")
-        edit_menu.add_command(label="Keyword Hint", command=self.show_keyword_hint, accelerator="Cmd+Shift+K")
-        edit_menu.add_separator()
-        edit_menu.add_command(label="Go to Line", command=self.show_goto_line, accelerator="Cmd+L")
+        edit_menu.add_command(label="Go to Line", command=self.show_goto_line, accelerator="Cmd+J")
+        edit_menu.add_command(label="Show Completions", command=self._show_completions, accelerator="Ctrl+Space")
+        edit_menu.add_command(label="Show Call Tip", command=self._show_calltip, accelerator="Ctrl+\\")
+        edit_menu.add_command(label="Show Surrounding Parens", command=self.flash_paren, accelerator="Ctrl+0")
 
         format_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Format", menu=format_menu)
+        format_menu.add_command(label="Format Paragraph", command=self.format_paragraph)
+        format_menu.add_separator()
         format_menu.add_command(label="Indent Region", command=self.indent_region, accelerator="Cmd+]")
         format_menu.add_command(label="Dedent Region", command=self.dedent_region, accelerator="Cmd+[")
+        format_menu.add_command(label="Comment Out Region", command=self.comment_region, accelerator="Ctrl+3")
+        format_menu.add_command(label="Uncomment Region", command=self.uncomment_region, accelerator="Ctrl+4")
         format_menu.add_separator()
-        format_menu.add_command(label="Comment Out Region", command=self.comment_region, accelerator="Cmd+/")
-        format_menu.add_command(label="Uncomment Region", command=self.uncomment_region, accelerator="Cmd+Shift+/")
+        format_menu.add_command(label="Tabify Region", command=self.tabify_region)
+        format_menu.add_command(label="Untabify Region", command=self.untabify_region)
+        format_menu.add_command(label="Toggle Tabs", command=self.toggle_tabs)
+        format_menu.add_separator()
+        format_menu.add_command(label="New Indent Width", command=self.change_indentwidth)
+        format_menu.add_command(label="Strip Trailing Whitespace", command=self.rstrip_region)
 
         run_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Run", menu=run_menu)
-        run_menu.add_command(label="Run Module", command=self.run_current_file, accelerator="Cmd+R")
+        run_menu.add_command(label="Run Module", command=self.run_current_file, accelerator="F5")
+        run_menu.add_command(label="Run... Customized", command=self.run_custom)
+        run_menu.add_command(label="Check Module", command=self.check_module)
+        run_menu.add_separator()
         run_menu.add_command(label="Debug Module", command=self.debug_module)
         run_menu.add_command(label="Run in Terminal", command=self.run_in_terminal, accelerator="Cmd+Shift+R")
         run_menu.add_separator()
-        run_menu.add_command(label="Check Module", command=self.check_module, accelerator="Cmd+Shift+C")
+        run_menu.add_command(label="Python Shell", command=self._open_python_shell)
 
         view_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="View", menu=view_menu)
-        view_menu.add_command(label="Toggle Terminal", command=self._toggle_terminal, accelerator="Cmd+J")
-
-        search_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="Search", menu=search_menu)
-        search_menu.add_command(label="Find in File", command=self.show_find_dialog, accelerator="Cmd+F")
-        search_menu.add_command(label="Replace", command=self.show_replace_dialog, accelerator="Cmd+Shift+H")
-        search_menu.add_command(label="Search in Files", command=self.show_search_dialog, accelerator="Cmd+Shift+F")
+        view_menu.add_command(label="Toggle Bottom Panel", command=self._toggle_bottom_notebook, accelerator="Cmd+Shift+J")
 
         help_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Help", menu=help_menu)
         help_menu.add_command(label="About tknote", command=self.show_about)
 
         # -- Editor context menu (right-click) --
-        self.editor_context_menu = tk.Menu(self.root, tearoff=0)
-        self.editor_context_menu.add_command(label="Cut", command=self.cut)
-        self.editor_context_menu.add_command(label="Copy", command=self.copy)
-        self.editor_context_menu.add_command(label="Paste", command=self.paste)
-        self.editor_context_menu.add_separator()
-        self.editor_context_menu.add_command(label="Select All", command=self.select_all)
-        self.editor_context_menu.add_separator()
-        self.editor_context_menu.add_command(label="Set Breakpoint",
-                                             command=self._toggle_breakpoint)
-        self.editor_context_menu.add_command(label="Clear Breakpoint",
-                                             command=self._clear_breakpoint)
+        self.editor_context_menu = None  # Created dynamically on right-click
 
         # -- Main layout --
         main_frame = ttk.Frame(self.root)
@@ -144,7 +142,6 @@ class MarkdownEditor:
             'get_current_folder': lambda: self.current_folder,
             'set_current_folder': lambda v: setattr(self, 'current_folder', v),
             'open_file_in_tab': self._open_file_in_tab,
-            'set_status': lambda msg: self.status_bar.config(text=msg),
             'file_deleted': self._on_file_deleted,
             'file_path_changed': self._on_file_path_changed,
             'new_file_requested': self.new_file,
@@ -153,7 +150,6 @@ class MarkdownEditor:
         # -- Git panel (inside auxiliary sidebar) --
         self.git_panel = GitPanel(auxiliary_sidebar_frame, callbacks={
             'get_current_folder': lambda: self.current_folder,
-            'set_status': lambda msg: self.status_bar.config(text=msg),
             'open_file_in_tab': self._open_file_in_tab,
             'refresh_file_tree': self.file_tree.refresh,
             'folder_opened': self._on_git_folder_opened,
@@ -176,43 +172,27 @@ class MarkdownEditor:
         )
         editor_paned.add(self.tabbed_editor, weight=3)
 
-        # -- Bottom panels (hidden by default) --
+        # -- Bottom notebook (tabs for Shell, Terminal, Debug, Packages) --
         cwd = os.path.expanduser('~')
-        self._shell_panel = PythonShell(editor_paned)
-        self._shell_panel.set_close_callback(self._toggle_shell)
+        self._bottom_notebook = ttk.Notebook(editor_paned)
+        self._bottom_notebook_shown = False
+        editor_paned.add(self._bottom_notebook, weight=0)
+
+        self._shell_panel = PythonShell(self._bottom_notebook, show_header=False)
         self._shell_panel._open_source_callback = self._on_debug_source
-
-        self._pkg_panel = PackageManager(editor_paned)
-        self._pkg_panel.set_close_callback(self._toggle_packages)
-
-        self._sys_term = SystemTerminal(editor_paned, cwd=cwd)
-        self._sys_term.set_close_callback(self._toggle_terminal)
-
-        # Debugger panel (hidden by default)
+        self._pkg_panel = PackageManager(self._bottom_notebook)
+        self._sys_term = SystemTerminal(self._bottom_notebook, cwd=cwd, show_header=False)
         from .debugger import Debugger
-        self._debug_panel = Debugger(editor_paned, self._shell_panel)
-        self._debug_panel.set_close_callback(self._toggle_debugger)
+        self._debug_panel = Debugger(self._bottom_notebook, self._shell_panel, show_header=False)
+
+        self._bottom_notebook.add(self._shell_panel, text='Python Shell')
+        self._bottom_notebook.add(self._sys_term, text='Terminal')
+        self._bottom_notebook.add(self._debug_panel, text='Debug')
+        self._bottom_notebook.add(self._pkg_panel, text='Packages')
 
         # -- Status bar --
         status_frame = ttk.Frame(self.root)
         status_frame.pack(fill=tk.X, side=tk.BOTTOM, padx=8)
-
-        # Center: status text
-        self.status_bar = ttk.Label(
-            status_frame, text="Ready", relief=tk.SUNKEN, anchor='w')
-        self.status_bar.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        # Cursor position
-        self._cursor_pos = ttk.Label(
-            status_frame, text='Ln 1, Col 1', relief=tk.SUNKEN,
-            padding=(6, 1))
-        self._cursor_pos.pack(side=tk.LEFT)
-        # Right (packed before terminal so it appears to its left):
-        # Python environment indicator
-        self._venv_status = ttk.Label(
-            status_frame, text='Python', relief=tk.SUNKEN,
-            cursor='hand2', padding=(6, 1))
-        self._venv_status.pack(side=tk.LEFT)
-        self._venv_status.bind('<Button-1>', lambda e: self._show_venv_popup())
 
         # Right: source control panel toggle
         self._git_panel_status = ttk.Label(
@@ -221,35 +201,36 @@ class MarkdownEditor:
         self._git_panel_status.pack(side=tk.RIGHT)
         self._git_panel_status.bind('<Button-1>', lambda e: self._toggle_auxiliary_sidebar())
 
-        # Right: terminal toggle
-        self._terminal_status = ttk.Label(
-            status_frame, text='⬆ Terminal', relief=tk.SUNKEN,
+        # Right: bottom panel toggle (unified button)
+        self._panel_status = ttk.Label(
+            status_frame, text='Panel ▴', relief=tk.SUNKEN,
             cursor='hand2', padding=(6, 1))
-        self._terminal_status.pack(side=tk.RIGHT)
-        self._terminal_status.bind(
-            '<Button-1>', lambda e: self._toggle_terminal())
-        # Right: debug toggle
-        self._debug_status = ttk.Label(
-            status_frame, text='🐞 Debug', relief=tk.SUNKEN,
-            cursor='hand2', padding=(6, 1))
-        self._debug_status.pack(side=tk.RIGHT)
-        self._debug_status.bind('<Button-1>', lambda e: self._toggle_debugger())
-        # Right: python shell entry
-        self._shell_status = ttk.Label(
-            status_frame, text='▶ Shell', relief=tk.SUNKEN,
-            cursor='hand2', padding=(6, 1))
-        self._shell_status.pack(side=tk.RIGHT)
-        self._shell_status.bind('<Button-1>', lambda e: self._toggle_shell())
+        self._panel_status.pack(side=tk.RIGHT)
+        self._panel_status.bind('<Button-1>', lambda e: self._toggle_bottom_notebook())
 
-        # Right: packages entry
-        self._pkg_status = ttk.Label(
-            status_frame, text='📦 Packages', relief=tk.SUNKEN,
+        # Python environment indicator (right)
+        self._venv_status = ttk.Label(
+            status_frame, text='Python', relief=tk.SUNKEN,
             cursor='hand2', padding=(6, 1))
-        self._pkg_status.pack(side=tk.RIGHT)
-        self._pkg_status.bind('<Button-1>', lambda e: self._toggle_packages())
-        # Update status bar widget references
+        self._venv_status.pack(side=tk.RIGHT)
+        self._venv_status.bind('<Button-1>', lambda e: self._show_venv_popup())
+
+        # Cursor position (right)
+        self._cursor_pos = ttk.Label(
+            status_frame, text='Ln 1, Col 1', relief=tk.SUNKEN,
+            padding=(6, 1))
+        self._cursor_pos.pack(side=tk.RIGHT)
+
         self._status_frame = status_frame
         self.git_panel.refresh()
+
+        # Push notebook sash down to hide it
+        self.root.update_idletasks()
+        try:
+            total = editor_paned.winfo_height()
+            editor_paned.sashpos(0, total)
+        except tk.TclError:
+            pass
 
     # ---- Shortcut binding for new editors ----------------------------------
 
@@ -259,102 +240,103 @@ class MarkdownEditor:
         editor.bind("<Command-o>", lambda _: self.open_file())
         editor.bind("<Command-s>", lambda _: self.save_file())
         editor.bind("<Command-Shift-S>", lambda _: self.save_file_as())
-        editor.bind("<Command-b>", lambda _: self.insert_format("**", "**"))
-        editor.bind("<Command-i>", lambda _: self.insert_format("*", "*"))
-        editor.bind("<Command-h>", lambda _: self.insert_heading())
-        editor.bind("<Command-k>", lambda _: self.insert_link())
-        editor.bind("<Command-j>", lambda _: self._toggle_terminal())
-        editor.bind("<Command-Shift-c>", lambda _: self.insert_format("`", "`"))
+        editor.bind("<Command-Shift-J>", lambda _: self._toggle_bottom_notebook())
         editor.bind("<Command-f>", lambda _: self.show_find_dialog())
+        editor.bind("<Command-g>", lambda _: self.find_again())
+        editor.bind("<Command-F3>", lambda _: self.find_selection())
         editor.bind("<Command-Shift-f>", lambda _: self.show_search_dialog())
+        editor.bind("<Command-r>", lambda _: self.show_replace_dialog())
+        editor.bind("<F5>", lambda _: self.run_current_file())
+        editor.bind("<Command-j>", lambda _: self.show_goto_line())
+        editor.bind("<Command-l>", lambda _: self.show_goto_line())
         editor.bind("<Command-a>", lambda _: self.select_all())
         editor.bind("<Command-z>", lambda _: self.undo())
         editor.bind("<Command-Shift-Z>", lambda _: self.redo())
-        editor.bind("<Command-Shift-P>", lambda _: self.flash_paren())
-        editor.bind("<Command-Shift-K>", lambda _: self.show_keyword_hint())
-        editor.bind("<Command-l>", lambda _: self.show_goto_line())
-        editor.bind("<Command-r>", lambda _: self.run_current_file())
         editor.bind("<Command-Shift-R>", lambda _: self.run_in_terminal())
         editor.bind("<Command-bracketright>", lambda _: self.indent_region())
         editor.bind("<Command-bracketleft>", lambda _: self.dedent_region())
+        editor.bind("<Control-Key-3>", lambda _: self.comment_region())
+        editor.bind("<Control-Key-4>", lambda _: self.uncomment_region())
         editor.bind("<Command-slash>", lambda _: self.comment_region())
         editor.bind("<Command-Shift-slash>", lambda _: self.uncomment_region())
-        editor.bind("<Command-Shift-H>", lambda _: self.show_replace_dialog())
-        editor.bind("<Button-2>", self.show_editor_context_menu)
-        editor.bind("<Button-3>", self.show_editor_context_menu)
-        editor.bind("<Control-Button-1>", self.show_editor_context_menu)
+        editor.bind("<Button-2>", self._editor_right_menu)
+        editor.bind("<Button-3>", self._editor_right_menu)
+        editor.bind("<Control-Button-1>", self._editor_right_menu)
 
         # Cursor position tracking
         editor.bind('<KeyRelease>', lambda e: self._update_cursor_pos())
         editor.bind('<ButtonRelease-1>', lambda e: self._update_cursor_pos())
 
-    # ---- Bottom panels (Shell / Packages / Terminal) -----------------------
+    # ---- Bottom notebook management -----------------------------------------
 
-    def _show_bottom_panel(self, panel):
-        """Toggle a bottom panel. Hide any other visible panel first.
+    def _toggle_bottom_notebook(self):
+        if self._bottom_notebook_shown:
+            try:
+                total = self.editor_paned.winfo_height()
+                self.editor_paned.sashpos(0, total)
+            except tk.TclError:
+                pass
+            self._bottom_notebook_shown = False
+            self._update_status_indicators()
+        else:
+            self._bottom_notebook_shown = True
+            self._update_status_indicators()
+            self.root.after_idle(self._show_notebook_sash)
 
-        Returns True if the panel is now visible, False if it was hidden.
-        """
-        if panel.winfo_ismapped():
-            self.editor_paned.forget(panel)
-            return False
-        # Hide any other visible bottom panel
-        for p in [self._shell_panel, self._pkg_panel, self._sys_term,
-                   self._debug_panel]:
-            if p is not panel and p.winfo_ismapped():
-                self.editor_paned.forget(p)
-        self.editor_paned.add(panel, weight=1)
-        panel.focus_input()
-        return True
+    def _show_notebook_sash(self):
+        """Position the sash after layout has settled."""
+        try:
+            total = self.editor_paned.winfo_height()
+            if total > 1:
+                target = min(400, total // 3)
+                self.editor_paned.sashpos(0, total - target)
+        except tk.TclError:
+            pass
 
-    def _toggle_shell(self):
-        """Show or hide the Python Shell panel."""
-        visible = self._show_bottom_panel(self._shell_panel)
-        self._shell_status.configure(text='⏹ Shell' if visible else '▶ Shell')
-        self.status_bar.configure(
-            text='Python Shell shown' if visible else 'Python Shell hidden')
+    def _switch_to_tab(self, tab_name):
+        tab_index = -1
+        for i, child in enumerate(self._bottom_notebook.winfo_children()):
+            if self._bottom_notebook.tab(i, 'text') == tab_name:
+                tab_index = i
+                break
+        if tab_index < 0:
+            return
+        if self._bottom_notebook_shown:
+            current = self._bottom_notebook.index('current')
+            if current == tab_index:
+                self._toggle_bottom_notebook()
+                return
+        if not self._bottom_notebook_shown:
+            self._toggle_bottom_notebook()
+        self._bottom_notebook.select(tab_index)
+        self._update_status_indicators()
+        child_widgets = self._bottom_notebook.winfo_children()
+        if 0 <= tab_index < len(child_widgets):
+            try:
+                child_widgets[tab_index].focus_input()
+            except AttributeError:
+                pass
 
-    def _toggle_packages(self):
-        """Show or hide the Packages panel."""
-        visible = self._show_bottom_panel(self._pkg_panel)
-        self._pkg_status.configure(
-            text='⏹ Packages' if visible else '📦 Packages')
-        self.status_bar.configure(
-            text='Packages shown' if visible else 'Packages hidden')
-
-    def _toggle_terminal(self):
-        """Show or hide the system Terminal panel."""
-        visible = self._show_bottom_panel(self._sys_term)
-        self._terminal_status.configure(
-            text='⬇ Terminal' if visible else '⬆ Terminal')
-        self.status_bar.configure(
-            text='Terminal shown' if visible else 'Terminal hidden')
-
-    def _show_shell(self):
-        """Show the Python Shell panel (called from status bar)."""
-        if not self._shell_panel.winfo_ismapped():
-            self._toggle_shell()
-
-    def _show_packages(self):
-        """Show the Packages panel (called from status bar)."""
-        if not self._pkg_panel.winfo_ismapped():
-            self._toggle_packages()
+    def _update_status_indicators(self):
+        if self._bottom_notebook_shown:
+            self._panel_status.config(text='Panel ▾')
+        else:
+            self._panel_status.config(text='Panel ▴')
 
     # ---- Debugger ----------------------------------------------------------
 
     def _toggle_debugger(self):
-        """Toggle the debugger panel and debug mode on/off."""
-        visible = self._show_bottom_panel(self._debug_panel)
-        if visible:
-            self._shell_panel.open_debugger(self._debug_panel)
-            self._debug_status.configure(text='⏹ Debug')
-            self.status_bar.configure(text='Debugger ON — run code in Shell to debug')
-            # Load breakpoints from all open editors
-            self._load_breakpoints_to_debugger()
-        else:
+        if self._shell_panel.is_debugging():
             self._shell_panel.close_debugger()
-            self._debug_status.configure(text='🐞 Debug')
-            self.status_bar.configure(text='Debugger OFF')
+            if self._bottom_notebook_shown:
+                current = self._bottom_notebook.index('current')
+                if self._bottom_notebook.tab(current, 'text') == 'Debug':
+                    self._switch_to_tab('Python Shell')
+            self._update_status_indicators()
+        else:
+            self._shell_panel.open_debugger(self._debug_panel)
+            self._load_breakpoints_to_debugger()
+            self._switch_to_tab('Debug')
 
     def _toggle_breakpoint(self):
         """Toggle a breakpoint on the current cursor line in the active editor."""
@@ -363,10 +345,6 @@ class MarkdownEditor:
             return
         lineno = int(float(editor.index('insert')))
         added = editor.toggle_breakpoint(lineno)
-        if added:
-            self.status_bar.configure(text=f'Breakpoint set at line {lineno}')
-        else:
-            self.status_bar.configure(text=f'Breakpoint cleared at line {lineno}')
         # Sync breakpoints to debugger if active
         self._sync_breakpoint_to_debugger(editor, lineno, added)
 
@@ -378,11 +356,8 @@ class MarkdownEditor:
         lineno = int(float(editor.index('insert')))
         if editor.has_breakpoint(lineno):
             editor.toggle_breakpoint(lineno)
-            self.status_bar.configure(text=f'Breakpoint cleared at line {lineno}')
             # Sync to debugger if active
             self._sync_breakpoint_to_debugger(editor, lineno, False)
-        else:
-            self.status_bar.configure(text=f'No breakpoint at line {lineno}')
 
     def _load_breakpoints_to_debugger(self):
         """Load all breakpoints from open editors into the debugger."""
@@ -444,7 +419,6 @@ class MarkdownEditor:
     def _show_venv_popup(self, event=None):
         """Show a popup menu for selecting/creating Python environments."""
         if not self.current_folder:
-            self.status_bar.config(text="Open a folder first to manage Python environments")
             return
 
         menu = tk.Menu(self.root, tearoff=0)
@@ -492,8 +466,6 @@ class MarkdownEditor:
             self.venv_manager.activate(venv_path)
             self._apply_venv_to_subsystems()
             self._update_venv_status()
-            self.status_bar.config(
-                text=f"Python env: {self.venv_manager.get_display_name()}")
         except ValueError as e:
             messagebox.showerror("Venv Error", str(e), parent=self.root)
 
@@ -510,8 +482,6 @@ class MarkdownEditor:
             self.venv_manager.create_venv(name)
             self._apply_venv_to_subsystems()
             self._update_venv_status()
-            self.status_bar.config(
-                text=f"Created and activated: {name}")
         except Exception as e:
             messagebox.showerror(
                 "Error", f"Failed to create venv:\n{e}", parent=self.root)
@@ -531,7 +501,6 @@ class MarkdownEditor:
         self.venv_manager.deactivate()
         self._apply_venv_to_subsystems()
         self._update_venv_status()
-        self.status_bar.config(text="Python: system")
 
     def _apply_venv_to_subsystems(self):
         """Apply the current venv state to all three bottom panels."""
@@ -545,12 +514,6 @@ class MarkdownEditor:
 
     def _on_tab_switch(self, tab_id):
         """Called when the active tab changes."""
-        tab = self.tabbed_editor.get_active_tab()
-        if tab and tab['file_path']:
-            base = os.path.basename(tab['file_path'])
-            self.status_bar.config(text=f"Editing: {base}")
-        else:
-            self.status_bar.config(text="New file")
         self.root.after(1, self._update_cursor_pos)
 
     def _update_cursor_pos(self):
@@ -588,7 +551,6 @@ class MarkdownEditor:
                             f.write(content)
                         tab['editor'].set_saved()
                     except Exception as e:
-                        self.status_bar.config(text=f"Error saving: {e}")
                         return
                 else:
                     # No path — switch to tab and do Save As
@@ -621,10 +583,8 @@ class MarkdownEditor:
         """Toggle the auxiliary sidebar from the status bar."""
         if self._auxiliary_sidebar_visible:
             self._hide_auxiliary_sidebar()
-            self.status_bar.config(text="Source Control hidden")
         else:
             self._show_auxiliary_sidebar()
-            self.status_bar.config(text="Source Control shown")
 
     # ---- File opening helpers ----------------------------------------------
 
@@ -639,7 +599,6 @@ class MarkdownEditor:
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
         except Exception as e:
-            self.status_bar.config(text=f"Error opening file: {e}")
             return
 
         self.tabbed_editor.add_tab(
@@ -647,7 +606,6 @@ class MarkdownEditor:
             file_path=file_path,
             content=content,
         )
-        self.status_bar.config(text=f"Opened: {os.path.basename(file_path)}")
 
     # ---- Bridge callbacks for FileTreePanel / GitPanel ---------------------
 
@@ -673,7 +631,6 @@ class MarkdownEditor:
         self.venv_manager.set_folder(folder)
         self.file_tree.populate(folder)
         self._sys_term.cd_to(folder)
-        self.status_bar.config(text=f"Opened: {os.path.basename(folder)}")
         self._update_venv_status()
         if self.venv_manager.is_active:
             self._apply_venv_to_subsystems()
@@ -682,14 +639,11 @@ class MarkdownEditor:
         """Reload file content in an open tab (e.g. after git rollback)."""
         tab_idx = self.tabbed_editor.find_tab_by_path(file_path)
         if tab_idx >= 0:
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    new_content = f.read()
-                tab = self.tabbed_editor._tabs[tab_idx]
-                tab['editor'].set_text(new_content)
-                tab['editor'].set_saved()
-            except Exception as e:
-                self.status_bar.config(text=f"Error reloading file: {e}")
+            with open(file_path, 'r', encoding='utf-8') as f:
+                new_content = f.read()
+            tab = self.tabbed_editor._tabs[tab_idx]
+            tab['editor'].set_text(new_content)
+            tab['editor'].set_saved()
 
     def _close_diff_tab(self, base_name):
         """Close the diff tab for the given file base name."""
@@ -718,10 +672,8 @@ class MarkdownEditor:
             with open(tab['file_path'], 'w', encoding='utf-8') as f:
                 f.write(content)
             tab['editor'].set_saved()
-            self.status_bar.config(text=f"Saved: {os.path.basename(tab['file_path'])}")
             return True
-        except Exception as e:
-            self.status_bar.config(text=f"Error saving file: {e}")
+        except Exception:
             return False
 
     # ---- File operations ---------------------------------------------------
@@ -735,7 +687,6 @@ class MarkdownEditor:
         if not filename:
             filename = 'Untitled'
         self.tabbed_editor.add_tab(title=filename, content='')
-        self.status_bar.config(text="New file")
 
     def open_file(self):
         file_path = filedialog.askopenfilename(
@@ -752,7 +703,6 @@ class MarkdownEditor:
             self.venv_manager.set_folder(folder_path)
             self.file_tree.populate(folder_path)
             self._sys_term.cd_to(folder_path)
-            self.status_bar.config(text=f"Opened folder: {os.path.basename(folder_path)}")
             self.git_panel.refresh()
             self._update_venv_status()
             if self.venv_manager.is_active:
@@ -766,7 +716,6 @@ class MarkdownEditor:
         self.git_panel.refresh()
         self._update_venv_status()
         self._apply_venv_to_subsystems()
-        self.status_bar.config(text="Folder closed")
 
     def save_file(self):
         tab = self.tabbed_editor.get_active_tab()
@@ -800,7 +749,6 @@ class MarkdownEditor:
         """
         tab = self.tabbed_editor.get_active_tab()
         if not tab:
-            self.status_bar.config(text="No file to run")
             return
 
         # IDLE-style: must save before running
@@ -816,9 +764,7 @@ class MarkdownEditor:
 
         source = tab['editor'].get_text()
 
-        # Show the Python shell
-        if not self._shell_panel.winfo_ismapped():
-            self._toggle_shell()
+        self._switch_to_tab('Python Shell')
         try:
             self.root.update_idletasks()
         except tk.TclError:
@@ -826,10 +772,6 @@ class MarkdownEditor:
 
         self._shell_panel.run_code(source, file_path=file_path,
                                    python_exe=self.venv_manager.get_python_exe())
-        try:
-            self.status_bar.config(text=f"Ran: {os.path.basename(file_path)}")
-        except tk.TclError:
-            pass  # widget may have been destroyed by user code
 
     def debug_module(self):
         """Debug the current file under the debugger.
@@ -839,7 +781,6 @@ class MarkdownEditor:
         """
         tab = self.tabbed_editor.get_active_tab()
         if not tab:
-            self.status_bar.config(text="No file to debug")
             return
 
         # Save first (IDLE-style: must save before debugging)
@@ -855,13 +796,11 @@ class MarkdownEditor:
 
         source = tab['editor'].get_text()
 
-        # Show the Python shell
-        if not self._shell_panel.winfo_ismapped():
-            self._toggle_shell()
-
-        # Open debugger if not active
+        self._switch_to_tab('Python Shell')
         if not self._shell_panel.is_debugging():
-            self._toggle_debugger()
+            self._shell_panel.open_debugger(self._debug_panel)
+            self._load_breakpoints_to_debugger()
+        self._switch_to_tab('Debug')
 
         try:
             self.root.update_idletasks()
@@ -869,17 +808,11 @@ class MarkdownEditor:
             pass
 
         self._shell_panel.run_code_debug(source, file_path=file_path)
-        try:
-            self.status_bar.config(
-                text=f"Debugging: {os.path.basename(file_path)}")
-        except tk.TclError:
-            pass
 
     def run_in_terminal(self):
         """Run the current file in the system terminal."""
         tab = self.tabbed_editor.get_active_tab()
         if not tab:
-            self.status_bar.config(text="No file to run")
             return
 
         # Save if there's a file path
@@ -891,9 +824,7 @@ class MarkdownEditor:
             dir_name = os.path.dirname(file_path)
             file_name = os.path.basename(file_path)
 
-            # Show the terminal
-            if not self._sys_term.winfo_ismapped():
-                self._toggle_terminal()
+            self._switch_to_tab('Terminal')
             try:
                 self.root.update_idletasks()
             except tk.TclError:
@@ -902,10 +833,6 @@ class MarkdownEditor:
             # cd to directory and run
             self._sys_term.cd_to(dir_name)
             self._sys_term.send_command(f'python3 -- {shlex.quote(file_name)}')
-            try:
-                self.status_bar.config(text=f"Running in Terminal: {file_name}")
-            except tk.TclError:
-                pass
         else:
             # Unsaved file — save first
             if not self.save_file_as():
@@ -916,20 +843,52 @@ class MarkdownEditor:
         """Syntax-check the current file without running it."""
         tab = self.tabbed_editor.get_active_tab()
         if not tab:
-            self.status_bar.config(text="No file to check")
             return
         source = tab['editor'].get_text()
         try:
             compile(source, tab.get('file_path', '<check>'), 'exec')
-            self.status_bar.config(text="Syntax OK")
             messagebox.showinfo("Check Module", "No syntax errors found.", parent=self.root)
         except SyntaxError as e:
-            self.status_bar.config(text=f"Syntax error at line {e.lineno}")
             messagebox.showerror(
                 "Syntax Error",
                 f"Line {e.lineno}: {e.msg}",
                 parent=self.root,
             )
+
+    def run_custom(self):
+        tab = self.tabbed_editor.get_active_tab()
+        if not tab:
+            return
+        if tab['file_path']:
+            if tab['editor'].is_modified():
+                self._save_to_tab(tab)
+            file_path = tab['file_path']
+        else:
+            if not self.save_file_as():
+                return
+            file_path = tab['file_path']
+        args_str = simpledialog.askstring('Run Customized', 'Command line arguments:', parent=self.root)
+        if args_str is None:
+            return
+        try:
+            args = shlex.split(args_str) if args_str.strip() else []
+        except ValueError as e:
+            messagebox.showerror('Run Customized', f'Invalid arguments: {e}', parent=self.root)
+            return
+        self._switch_to_tab('Terminal')
+        try:
+            self.root.update_idletasks()
+        except tk.TclError:
+            pass
+        cwd = os.path.dirname(file_path)
+        self._sys_term.cd_to(cwd)
+        cmd = f'python3 -- {shlex.quote(os.path.basename(file_path))}'
+        if args:
+            cmd += ' ' + ' '.join(shlex.quote(a) for a in args)
+        self._sys_term.send_command(cmd)
+
+    def _open_python_shell(self):
+        self._switch_to_tab('Python Shell')
 
     # ---- Region / Navigation (delegates to active editor) -------------------
 
@@ -968,7 +927,6 @@ class MarkdownEditor:
         )
         if lineno:
             editor.go_to_line(lineno)
-            self.status_bar.config(text=f"Jumped to line {lineno}")
 
     def show_replace_dialog(self):
         """Dialog: find and replace text in the current file."""
@@ -1006,9 +964,6 @@ class MarkdownEditor:
             new_content = content.replace(query, replacement)
             if new_content != content:
                 editor.set_text(new_content)
-                self.status_bar.config(text=f"Replaced all occurrences")
-            else:
-                self.status_bar.config(text="No matches found")
 
         ttk.Button(btn_frame, text="Replace All", command=do_replace).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_frame, text="Close", command=dialog.destroy).pack(side=tk.LEFT, padx=2)
@@ -1136,13 +1091,210 @@ class MarkdownEditor:
             return
         editor.show_keyword_hint()
 
-    def show_editor_context_menu(self, event):
+    def _editor_right_menu(self, event):
+        editor = self.editor
+        if editor is None:
+            return
+        text = editor.get_text_widget()
         try:
-            self.editor_context_menu.tk_popup(event.x_root, event.y_root)
+            text.mark_set('insert', f'@{event.x},{event.y}')
+        except tk.TclError:
+            pass
+        try:
+            sel_first = text.index('sel.first')
+            sel_last = text.index('sel.last')
+            if not text.compare(sel_first, '<=', 'insert') or not text.compare('insert', '<=', sel_last):
+                text.tag_remove('sel', '1.0', 'end')
+                has_sel = False
+            else:
+                has_sel = True
+        except tk.TclError:
+            has_sel = False
+        try:
+            has_clipboard = bool(self.root.clipboard_get())
+        except tk.TclError:
+            has_clipboard = False
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label='Cut', command=self.cut, state=tk.NORMAL if has_sel else tk.DISABLED)
+        menu.add_command(label='Copy', command=self.copy, state=tk.NORMAL if has_sel else tk.DISABLED)
+        menu.add_command(label='Paste', command=self.paste, state=tk.NORMAL if has_clipboard else tk.DISABLED)
+        menu.add_separator()
+        menu.add_command(label='Set Breakpoint', command=self._toggle_breakpoint)
+        menu.add_command(label='Clear Breakpoint', command=self._clear_breakpoint)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
         finally:
-            self.editor_context_menu.grab_release()
+            menu.grab_release()
+
+    # ---- Format menu (IDLE-style) ------------------------------------------
+
+    def format_paragraph(self):
+        editor = self.editor
+        if editor is None:
+            return
+        import textwrap
+        text = editor.get_text_widget()
+        try:
+            sel_first = text.index('sel.first')
+            sel_last = text.index('sel.last')
+            has_sel = True
+        except tk.TclError:
+            sel_first = text.index('insert linestart')
+            while True:
+                prev = text.index(f'{sel_first} -1 line')
+                if text.compare(prev, '==', sel_first):
+                    break
+                line = text.get(f'{prev} linestart', f'{prev} lineend').strip()
+                if not line:
+                    break
+                sel_first = text.index(f'{prev} linestart')
+            sel_last = text.index('insert')
+            while True:
+                next_line = text.index(f'{sel_last} +1 line')
+                if text.compare(next_line, '==', sel_last):
+                    break
+                line = text.get(f'{next_line} linestart', f'{next_line} lineend').strip()
+                if not line:
+                    break
+                sel_last = text.index(f'{next_line} lineend')
+            has_sel = False
+        paragraph = text.get(sel_first, sel_last)
+        lines = paragraph.splitlines()
+        result = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped:
+                result.append(textwrap.fill(stripped, width=72))
+            else:
+                result.append('')
+        new_text = '\n'.join(result)
+        if new_text != paragraph:
+            text.delete(sel_first, sel_last)
+            text.insert(sel_first, new_text)
+            if has_sel:
+                text.tag_add('sel', sel_first, f'{sel_first}+{len(new_text)}c')
+
+    def tabify_region(self):
+        editor = self.editor
+        if editor is None:
+            return
+        tabwidth = editor._auto_indent.tabwidth
+        first, last = editor._get_selected_lines()
+        editor._undo.undo_block_start()
+        try:
+            for line in range(first, last + 1):
+                line_text = editor.get(f'{line}.0', f'{line}.0 lineend')
+                indent = len(line_text) - len(line_text.lstrip(' '))
+                if indent > 0:
+                    tabs = '\t' * (indent // tabwidth)
+                    spaces = ' ' * (indent % tabwidth)
+                    editor.delete(f'{line}.0', f'{line}.0+{indent}c')
+                    editor.insert(f'{line}.0', tabs + spaces)
+        finally:
+            editor._undo.undo_block_stop()
+
+    def untabify_region(self):
+        editor = self.editor
+        if editor is None:
+            return
+        tabwidth = editor._auto_indent.tabwidth
+        first, last = editor._get_selected_lines()
+        editor._undo.undo_block_start()
+        try:
+            for line in range(first, last + 1):
+                line_text = editor.get(f'{line}.0', f'{line}.0 lineend')
+                stripped = line_text.lstrip('\t')
+                tab_count = len(line_text) - len(stripped)
+                if tab_count > 0:
+                    editor.delete(f'{line}.0', f'{line}.0+{tab_count}c')
+                    editor.insert(f'{line}.0', ' ' * (tab_count * tabwidth))
+        finally:
+            editor._undo.undo_block_stop()
+
+    def toggle_tabs(self):
+        editor = self.editor
+        if editor is None:
+            return
+        current = editor._auto_indent.usetabs
+        editor._auto_indent.usetabs = not current
+        mode = 'Tabs' if editor._auto_indent.usetabs else 'Spaces'
+
+    def change_indentwidth(self):
+        editor = self.editor
+        if editor is None:
+            return
+        current = editor._auto_indent.indentwidth
+        new_width = simpledialog.askinteger(
+            'New Indent Width',
+            f'Current indent width: {current}\nEnter new width (2-16):',
+            parent=self.root, minvalue=2, maxvalue=16, initialvalue=current)
+        if new_width:
+            editor._auto_indent.indentwidth = new_width
+
+    def rstrip_region(self):
+        editor = self.editor
+        if editor is None:
+            return
+        try:
+            first = int(float(editor.index('sel.first')))
+            last = int(float(editor.index('sel.last')))
+        except (tk.TclError, ValueError):
+            first, last = 1, int(float(editor.index('end-1c')))
+        editor._undo.undo_block_start()
+        try:
+            for line in range(first, last + 1):
+                line_text = editor.get(f'{line}.0', f'{line}.0 lineend')
+                stripped = line_text.rstrip()
+                if stripped != line_text:
+                    editor.delete(f'{line}.0', f'{line}.0 lineend')
+                    editor.insert(f'{line}.0', stripped)
+        finally:
+            editor._undo.undo_block_stop()
 
     # ---- Search ------------------------------------------------------------
+
+    def find_again(self):
+        if not self._last_search_query:
+            return
+        editor = self.editor
+        if editor is None:
+            return
+        query = self._last_search_query
+        case = self._last_search_case
+        nocase = not case
+        try:
+            match = editor.search(f"\\m{re.escape(query)}\\M", "insert", forwards=True, regexp=1, nocase=nocase)
+            if match:
+                editor.mark_set("insert", match)
+                editor.see(match)
+            else:
+                match = editor.search(f"\\m{re.escape(query)}\\M", "1.0", forwards=True, regexp=1, nocase=nocase)
+                if match:
+                    editor.mark_set("insert", match)
+                    editor.see(match)
+        except re.error:
+            pass
+
+    def find_selection(self):
+        editor = self.editor
+        if editor is None:
+            return
+        try:
+            sel = editor.get(tk.SEL_FIRST, tk.SEL_LAST)
+            if sel:
+                self.find_in_editor(sel)
+        except tk.TclError:
+            pass
+
+    def _show_completions(self):
+        editor = self.editor
+        if editor is not None:
+            editor._autocomplete.force_open_completions_event(None)
+
+    def _show_calltip(self):
+        editor = self.editor
+        if editor is not None:
+            editor._calltip.try_open_calltip_event(None)
 
     def show_find_dialog(self):
         dialog = tk.Toplevel(self.root)
@@ -1179,6 +1331,8 @@ class MarkdownEditor:
         search_entry.bind("<Return>", lambda _: do_find())
 
     def find_in_editor(self, query, case_sensitive=False):
+        self._last_search_query = query
+        self._last_search_case = case_sensitive
         editor = self.editor
         if editor is None:
             return
@@ -1199,15 +1353,11 @@ class MarkdownEditor:
             if first_match:
                 editor.mark_set("insert", first_match)
                 editor.see(first_match)
-                self.status_bar.config(text=f"Found matches")
-            else:
-                self.status_bar.config(text="No matches found")
         except re.error:
-            self.status_bar.config(text="Invalid search pattern")
+            pass
 
     def show_search_dialog(self):
         if not self.current_folder:
-            self.status_bar.config(text="No folder opened")
             return
 
         dialog = tk.Toplevel(self.root)

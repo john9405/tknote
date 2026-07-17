@@ -27,7 +27,7 @@ class _EditwinAdapter:
     def __init__(self, text_widget):
         self.text = text_widget
         self.indentwidth = 4
-        self.tabwidth = 4
+        self.tabwidth = 8
         self.prompt_last_line = ''
         self.num_context_lines = (50, 500, 5000)
         self.flist = None  # no subprocess → autocomplete uses local mode
@@ -90,12 +90,12 @@ class EditorWidget(tk.Frame):
       - AutoIndent for smart Tab/Enter/Backspace
     """
 
-    LINE_NUM_BG = '#f0f0f0'
-    LINE_NUM_FG = '#999999'
-    EDITOR_FONT = ('Monaco', 12)
+    LINE_NUM_BG = '#ffffff'
+    LINE_NUM_FG = 'gray'
+    EDITOR_FONT = ('TkFixedFont', 11)
     EDITOR_BG = '#ffffff'
-    EDITOR_FG = '#1e1e1e'
-    INSERT_BG = '#1e1e1e'
+    EDITOR_FG = '#000000'
+    INSERT_BG = '#000000'
 
     def __init__(self, parent, **kwargs):
         super().__init__(parent, **kwargs)
@@ -120,8 +120,8 @@ class EditorWidget(tk.Frame):
         )
         self._line_text.config(state=tk.DISABLED)
         self._line_text.tag_config('linenumber', justify=tk.RIGHT)
-        self._line_text.tag_config('breakpoint', foreground='#d32f2f',
-                                    font=('Monaco', 10, 'bold'))
+        self._line_text.tag_config('breakpoint', foreground='#000000',
+                                    background='#ffff55')
         self._line_text.insert('end', '1', 'linenumber')
         # Prepare for grid; show_sidebar / hide_sidebar manage visibility
         self._prev_end = 1
@@ -226,6 +226,9 @@ class EditorWidget(tk.Frame):
         # Paren close → flash match
         for closer in (')', ']', '}'):
             text.bind(closer, self._on_paren_close)
+
+        # Paren matching — IDLE standard Ctrl+0
+        text.bind('<Control-Key-0>', self._paren_match.flash_paren_event)
 
         # Keyword hint — force-show on Ctrl+Shift+K / Cmd+Shift+K
         text.bind('<Control-Shift-K>', self._keyword_hint.force_show)
@@ -665,25 +668,25 @@ class EditorWidget(tk.Frame):
         return first, last
 
     def comment_region(self):
-        """Comment out selected lines with '# ' (IDLE Alt+3)."""
+        """Comment out selected lines with '##' (IDLE style)."""
         first, last = self._get_selected_lines()
         self._undo.undo_block_start()
         try:
             for line in range(first, last + 1):
-                self._text.insert(f'{line}.0', '# ')
+                self._text.insert(f'{line}.0', '##')
         finally:
             self._undo.undo_block_stop()
         # Re-select the region
         self._text.tag_add('sel', f'{first}.0', f'{last + 1}.0')
 
     def uncomment_region(self):
-        """Remove leading '# ' from selected lines (IDLE Alt+4)."""
+        """Remove leading '##' or '#' from selected lines (IDLE style)."""
         first, last = self._get_selected_lines()
         self._undo.undo_block_start()
         try:
             for line in range(first, last + 1):
                 content = self._text.get(f'{line}.0', f'{line}.0+2c')
-                if content == '# ':
+                if content == '##':
                     self._text.delete(f'{line}.0', f'{line}.0+2c')
                 elif content[:1] == '#':
                     self._text.delete(f'{line}.0', f'{line}.0+1c')

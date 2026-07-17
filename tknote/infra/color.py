@@ -24,16 +24,18 @@ from idlelib.colorizer import ColorDelegator as _BaseColorDelegator, color_confi
 #   ERROR        — for syntax error display in shell
 #   hit          — for search result highlighting
 
+# IDLE Classic color scheme (matches Python's default IDLE theme)
+# keyword=orange, builtin=purple, comment=red, string=green, definition=blue
 _TAGDEFS = {
-    "COMMENT":    {'foreground': '#6a9955', 'background': None},
-    "KEYWORD":    {'foreground': '#0000ff', 'background': None},
-    "BUILTIN":    {'foreground': '#795e26', 'background': None},
-    "STRING":     {'foreground': '#a31515', 'background': None},
-    "DEFINITION": {'foreground': '#267f99', 'background': None},
+    "COMMENT":    {'foreground': '#dd0000', 'background': None},
+    "KEYWORD":    {'foreground': '#ff7700', 'background': None},
+    "BUILTIN":    {'foreground': '#900090', 'background': None},
+    "STRING":     {'foreground': '#00aa00', 'background': None},
+    "DEFINITION": {'foreground': '#0000ff', 'background': None},
     "SYNC":       {'foreground': None,      'background': None},
     "TODO":       {'foreground': None,      'background': None},
-    "ERROR":      {'foreground': '#f44747', 'background': None},
-    "hit":        {'foreground': '#000000', 'background': '#ffff00'},
+    "ERROR":      {'foreground': '#000000', 'background': '#ff7777'},
+    "hit":        {'foreground': '#ffffff', 'background': '#000000'},
 }
 
 
@@ -60,12 +62,11 @@ class ColorDelegator(_BaseColorDelegator):
         text = self.delegate
         if text is not None:
             text.configure(
-                foreground='#1e1e1e',
+                foreground='#000000',
                 background='#ffffff',
-                insertbackground='#1e1e1e',
+                insertbackground='#000000',
                 selectforeground='#ffffff',
-                selectbackground='#264f78',
-                inactiveselectbackground='#d4d4d4',
+                selectbackground='gray',
             )
         # Apply tag colors from tagdefs
         super().config_colors()

@@ -106,8 +106,9 @@ class PythonShell(ttk.Frame):
         'stderr':  {'foreground': '#d32f2f'},   # error output
     }
 
-    def __init__(self, parent, **kwargs):
+    def __init__(self, parent, show_header=True, **kwargs):
         super().__init__(parent, **kwargs)
+        self._show_header = show_header
         self._close_callback = None
         self._console = None
         self._locals = {}
@@ -128,16 +129,17 @@ class PythonShell(ttk.Frame):
         self.grid_rowconfigure(2, weight=1)
         self.grid_columnconfigure(0, weight=1)
 
-        # Header bar
-        header = ttk.Frame(self)
-        header.grid(row=0, column=0, sticky='ew')
+        if self._show_header:
+            # Header bar
+            header = ttk.Frame(self)
+            header.grid(row=0, column=0, sticky='ew')
 
-        ttk.Label(header, text='Python Shell', font=('Helvetica', 10, 'bold')).pack(
-            side=tk.LEFT, padx=(4, 0), pady=(2, 0))
+            ttk.Label(header, text='Python Shell', font=('Helvetica', 10, 'bold')).pack(
+                side=tk.LEFT, padx=(4, 0), pady=(2, 0))
 
-        # Separator
-        ttk.Separator(self, orient=tk.HORIZONTAL).grid(
-            row=1, column=0, sticky='ew')
+            # Separator
+            ttk.Separator(self, orient=tk.HORIZONTAL).grid(
+                row=1, column=0, sticky='ew')
 
         # Main shell Text widget
         text_frame = tk.Frame(self, bg=self.SHELL_BG)

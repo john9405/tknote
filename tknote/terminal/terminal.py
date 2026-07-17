@@ -58,8 +58,9 @@ class SystemTerminal(ttk.Frame):
         'error':  {'foreground': '#d32f2f'},
     }
 
-    def __init__(self, parent, cwd: str = None, **kwargs):
+    def __init__(self, parent, cwd: str = None, show_header=True, **kwargs):
         super().__init__(parent, **kwargs)
+        self._show_header = show_header
         self._close_cb = None
         self._cwd = cwd or os.path.expanduser('~')
         self._venv_path: Optional[str] = None
@@ -82,14 +83,15 @@ class SystemTerminal(ttk.Frame):
         self.grid_rowconfigure(2, weight=1)
         self.grid_columnconfigure(0, weight=1)
 
-        # Header bar
-        header = ttk.Frame(self)
-        header.grid(row=0, column=0, sticky='ew')
-        ttk.Label(header, text='Terminal', font=('Helvetica', 10, 'bold')).pack(
-            side=tk.LEFT, padx=(4, 0), pady=(2, 0))
+        if self._show_header:
+            # Header bar
+            header = ttk.Frame(self)
+            header.grid(row=0, column=0, sticky='ew')
+            ttk.Label(header, text='Terminal', font=('Helvetica', 10, 'bold')).pack(
+                side=tk.LEFT, padx=(4, 0), pady=(2, 0))
 
-        ttk.Separator(self, orient=tk.HORIZONTAL).grid(
-            row=1, column=0, sticky='ew')
+            ttk.Separator(self, orient=tk.HORIZONTAL).grid(
+                row=1, column=0, sticky='ew')
 
         # ── Output area (read-only, scrollable) ──
         out_frame = ttk.Frame(self)

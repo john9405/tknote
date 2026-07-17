@@ -6,7 +6,7 @@ import tkinter as tk
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
-def _get_line_indent(line, tabwidth=4):
+def _get_line_indent(line, tabwidth=8):
     """Return (raw_indent_chars, effective_spaces) for a line."""
     raw = len(line) - len(line.lstrip(' \t'))
     effective = len(line[:raw].expandtabs(tabwidth))
@@ -36,7 +36,7 @@ class AutoIndent:
     """
 
     indentwidth = 4      # spaces per indent level
-    tabwidth = 4         # display width of a tab character
+    tabwidth = 8         # display width of a tab character (IDLE default)
     usetabs = False      # True → use tabs; False → use spaces
 
     def __init__(self, text_widget, undo=None):

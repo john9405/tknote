@@ -15,7 +15,7 @@ class _EditwinAdapter:
     def __init__(self, text_widget):
         self.text = text_widget
         self.indentwidth = 4
-        self.tabwidth = 4
+        self.tabwidth = 8
         self.prompt_last_line = ''   # not a shell, so no prompt
         self.num_context_lines = (50, 500, 5000)
 
@@ -55,7 +55,7 @@ class ParenMatch(_BaseParenMatch):
         cls.FLASH_DELAY = 500   # ms; 0 = stay until cursor moves
         cls.BELL = True         # bell on mismatch
         cls.HILITE_CONFIG = {
-            'background': '#b0b0b0',
+            'background': 'gray',
             'foreground': '#000000',
         }
 
