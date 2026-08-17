@@ -74,7 +74,7 @@ class TabbedEditor(ttk.Frame):
         tab_frame = ttk.Frame(self.content_frame)
 
         # Editor widget (idlelib-style: line numbers + text + syntax highlighting)
-        editor = EditorWidget(tab_frame)
+        editor = EditorWidget(tab_frame, file_path=file_path)
         editor.pack(fill=tk.BOTH, expand=True)
 
         if content:
@@ -191,6 +191,11 @@ class TabbedEditor(ttk.Frame):
         if tab:
             tab['file_path'] = file_path
             tab['title'] = os.path.basename(file_path)
+            editor = tab['editor']
+            editor._file_path = file_path
+            bookmarks = getattr(editor, '_bookmarks', None)
+            if bookmarks is not None:
+                bookmarks.load()
             self._redraw()
 
     def set_tab_title(self, tab_id, title):

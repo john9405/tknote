@@ -21,8 +21,11 @@ from idlelib.colorizer import ColorDelegator as _BaseColorDelegator, color_confi
 #
 # We also add:
 #   TODO         — internal dirty-region marker (must be invisible)
-#   ERROR        — for syntax error display in shell
 #   hit          — for search result highlighting
+#
+# NOTE: "ERROR" (syntax-error highlight) is intentionally NOT a tagdef —
+# the colorizer's removecolors() pass would wipe it.  The shell configures
+# it directly (terminal/shell.py TAG_STYLES).
 
 # IDLE Classic color scheme (matches Python's default IDLE theme)
 # keyword=orange, builtin=purple, comment=red, string=green, definition=blue
@@ -34,7 +37,6 @@ _TAGDEFS = {
     "DEFINITION": {'foreground': '#0000ff', 'background': None},
     "SYNC":       {'foreground': None,      'background': None},
     "TODO":       {'foreground': None,      'background': None},
-    "ERROR":      {'foreground': '#000000', 'background': '#ff7777'},
     "hit":        {'foreground': '#ffffff', 'background': '#000000'},
 }
 

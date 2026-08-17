@@ -16,34 +16,7 @@ from ..infra.color import ColorDelegator
 from ..infra.parenmatch import ParenMatch
 from ..infra.autoindent import AutoIndent
 from ..infra.keywordhint import KeywordHint
-
-
-# ── Editwin adapter (shared by ParenMatch and AutoComplete) ────────────────
-
-class _EditwinAdapter:
-    """Minimal adapter so idlelib's HyperParser/AutoComplete see the
-    attributes they expect from an EditorWindow-like object."""
-
-    def __init__(self, text_widget):
-        self.text = text_widget
-        self.indentwidth = 4
-        self.tabwidth = 8
-        self.prompt_last_line = ''
-        self.num_context_lines = (50, 500, 5000)
-        self.flist = None  # no subprocess → autocomplete uses local mode
-
-    @property
-    def text_frame(self):
-        return self.text.master
-
-    def is_char_in_string(self, text_index):
-        return "STRING" in self.text.tag_names(text_index)
-
-    def _build_char_in_string_func(self, startindex):
-        def inner(offset, _startindex=startindex,
-                  _icis=self.is_char_in_string):
-            return _icis(_startindex + "+%dc" % offset)
-        return inner
+from ..infra.editwin_adapter import EditwinAdapter
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -97,13 +70,16 @@ class EditorWidget(tk.Frame):
     EDITOR_FG = '#000000'
     INSERT_BG = '#000000'
 
-    def __init__(self, parent, **kwargs):
+    # Tk keysym names for closing bracket keys.
+    _CLOSER_KEYSYMS = {')': 'parenright', ']': 'bracketright', '}': 'braceright'}
+
+    def __init__(self, parent, file_path=None, **kwargs):
         super().__init__(parent, **kwargs)
         self._modified = False
         self._line_numbers_visible = True
         self._sidebar_width = None
         self._breakpoints: set[int] = set()  # line numbers with breakpoints
-        self._file_path = None               # set externally by tab
+        self._file_path = file_path          # set by the owning tab
         self._build_ui()
 
     # ── UI construction ───────────────────────────────────────────────────
@@ -122,6 +98,8 @@ class EditorWidget(tk.Frame):
         self._line_text.tag_config('linenumber', justify=tk.RIGHT)
         self._line_text.tag_config('breakpoint', foreground='#000000',
                                     background='#ffff55')
+        self._line_text.tag_config('bookmark', foreground='#000000',
+                                    background='#e1f5fe')
         self._line_text.insert('end', '1', 'linenumber')
         # Prepare for grid; show_sidebar / hide_sidebar manage visibility
         self._prev_end = 1
@@ -130,6 +108,7 @@ class EditorWidget(tk.Frame):
         # ── Text frame (holds main editor Text + scrollbar) ──
         text_frame = tk.Frame(self)
         text_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._text_frame = text_frame
 
         # ── Main editor Text ──
         self._text = tk.Text(
@@ -178,11 +157,25 @@ class EditorWidget(tk.Frame):
 
         # ── Integrated features ──
         self._paren_match = ParenMatch(self._text)
+        from ..infra.parenmatch import PersistentParen
+        self._persist_paren = PersistentParen(self._text)
         self._auto_indent = AutoIndent(self._text, undo=self._undo)
         self._autocomplete = self._setup_autocomplete()
         self._calltip = self._setup_calltip()
         self._keyword_hint = KeywordHint(self._text)
         self._keyword_hint.attach()
+        from .smartkeys import SmartKeys
+        self._smart = SmartKeys(self)
+        from .bookmarks import BookmarkManager
+        self._bookmarks = BookmarkManager(self)
+        from .codecontext import CodeContext
+        self._code_context = CodeContext(self)
+        from .folding import FoldManager, FoldMargin
+        self._fold = FoldManager(self)
+        self._fold_margin = FoldMargin(self, self)
+        # Pack order: line numbers | fold markers | editor text.
+        self._fold_margin.pack(side=tk.LEFT, fill=tk.Y,
+                               before=self._text_frame)
 
         # ── Key bindings ──
         self._setup_bindings()
@@ -214,18 +207,26 @@ class EditorWidget(tk.Frame):
         text.bind('<<beginning-of-line>>', self._home_callback)
         text.bind('<<center-insert>>', self.center_insert_event)
 
-        # Autocomplete triggers
+        # Autocomplete triggers — KeyRelease: the typed char must be in
+        # the buffer before HyperParser can see the context (IDLE binds
+        # KeyRelease for the same reason).
         text.bind('<Control-space>', self._autocomplete.force_open_completions_event)
-        text.bind('<Key-period>', self._autocomplete.try_open_completions_event, add=True)
-        text.bind('<Key-slash>', self._autocomplete.try_open_completions_event, add=True)
+        text.bind('<KeyRelease-period>', self._autocomplete.try_open_completions_event, add=True)
+        text.bind('<KeyRelease-slash>', self._autocomplete.try_open_completions_event, add=True)
 
-        # Calltip on opening parenthesis
-        text.bind('<Key-parenleft>', self._calltip.try_open_calltip_event, add=True)
-        text.bind('<Key-bracketleft>', self._on_bracket_open, add=True)
+        # Calltip — '(' and '[' on KeyRelease; refresh on ')'; retrigger
+        # while typing arguments on ','; Ctrl+\ forces a tip (menu key).
+        text.bind('<KeyRelease-parenleft>', self._calltip.try_open_calltip_event, add=True)
+        text.bind('<KeyRelease-parenright>', self._calltip.refresh_calltip_event, add=True)
+        text.bind('<KeyRelease-bracketleft>', self._calltip.try_open_calltip_event, add=True)
+        text.bind('<Key-comma>', self._on_comma, add=True)
+        text.bind('<Control-backslash>', self._calltip.force_open_calltip_event, add=True)
 
-        # Paren close → flash match
+        # Paren close → flash match (KeyRelease: the closer must be in
+        # the buffer for the matcher to find it).
         for closer in (')', ']', '}'):
-            text.bind(closer, self._on_paren_close)
+            text.bind(f'<KeyRelease-{self._CLOSER_KEYSYMS[closer]}>',
+                      self._on_paren_close)
 
         # Paren matching — IDLE standard Ctrl+0
         text.bind('<Control-Key-0>', self._paren_match.flash_paren_event)
@@ -234,22 +235,69 @@ class EditorWidget(tk.Frame):
         text.bind('<Control-Shift-K>', self._keyword_hint.force_show)
         text.bind('<Command-Shift-K>', self._keyword_hint.force_show)
 
+        # ── IDEA-style editing keys (SmartKeys) ──
+        for opener in ('parenleft', 'bracketleft', 'braceleft'):
+            text.bind(f'<Key-{opener}>', self._smart.auto_close_opener,
+                      add=True)
+        for quote in ('quoteright', 'apostrophe', 'quotedbl'):
+            text.bind(f'<Key-{quote}>', self._smart.auto_close_quote,
+                      add=True)
+        for closer in (')', ']', '}'):
+            text.bind(closer, self._smart.skip_over_closer, add=True)
+        text.bind('<Command-d>', self._smart.duplicate_line_or_selection)
+        text.bind('<Alt-Shift-Up>', self._smart.move_line_up)
+        text.bind('<Alt-Shift-Down>', self._smart.move_line_down)
+        # Fallback move-line bindings (some Aqua builds don't map Option)
+        text.bind('<Control-Shift-Up>', self._smart.move_line_up)
+        text.bind('<Control-Shift-Down>', self._smart.move_line_down)
+        text.bind('<Control-Shift-j>', self._smart.join_lines)
+        text.bind('<Control-w>', self._smart.expand_selection)
+        text.bind('<Control-Shift-W>', self._smart.shrink_selection)
+        # Reset the expansion ladder when the selection changes
+        text.bind('<KeyRelease>', self._smart._on_keyrelease, add=True)
+
+        # Persistent bracket-pair highlight at the cursor
+        text.bind('<KeyRelease>', self._persist_paren.schedule_check, add=True)
+        text.bind('<ButtonRelease-1>', self._persist_paren.schedule_check, add=True)
+
+        # Bookmarks — F2 toggle, Shift+F2 next, Alt+F2 previous
+        text.bind('<F2>', self._bookmark_toggle_event)
+        text.bind('<Shift-F2>', self._bookmark_next_event)
+        text.bind('<Alt-F2>', self._bookmark_prev_event)
+
+        # Breakpoint toggle (IDEA-style F9 convenience)
+        text.bind('<F9>', lambda e: self.toggle_breakpoint())
+
+        # Code context strip — Ctrl/Cmd+Shift+C toggles
+        text.bind('<Control-Shift-C>', self.toggle_code_context)
+        text.bind('<Command-Shift-C>', self.toggle_code_context)
+
+        # Folding — Cmd+Alt+[ toggles at cursor, Cmd+Alt+] all;
+        # Ctrl+Shift+[/] as a fallback for Option-less keyboards.
+        text.bind('<Command-Alt-bracketleft>', self.toggle_fold)
+        text.bind('<Command-Alt-bracketright>', self.toggle_fold_all)
+        text.bind('<Control-Shift-bracketleft>', self.toggle_fold)
+        text.bind('<Control-Shift-bracketright>', self.toggle_fold_all)
+
     def _setup_autocomplete(self):
-        """Set up idlelib autocomplete with editwin adapter."""
-        from idlelib.autocomplete import AutoComplete
-        adapter = _EditwinAdapter(self._text)
-        return AutoComplete(editwin=adapter, tags=None)
+        """Set up autocomplete (with doc preview) via editwin adapter."""
+        from .completion import AutoCompleteEx
+        adapter = EditwinAdapter(self._text)
+        return AutoCompleteEx(editwin=adapter, tags=None)
 
     def _setup_calltip(self):
-        """Set up idlelib calltip (function signature hints)."""
-        from idlelib.calltip import Calltip
-        adapter = _EditwinAdapter(self._text)
-        return Calltip(editwin=adapter)
+        """Set up calltip ('(' + '[' support) via editwin adapter."""
+        from .calltip_ex import CalltipEx
+        adapter = EditwinAdapter(self._text)
+        return CalltipEx(editwin=adapter)
 
-    def _on_bracket_open(self, event):
-        """Open bracket '[' — try calltip for e.g. dict access, but
-        don't interfere with normal typing."""
-        return None  # let normal insertion proceed
+    def _on_comma(self, event):
+        """Retrigger the calltip while typing arguments (IDEA-style)."""
+        ac = self._autocomplete
+        if ac.autocompletewindow and ac.autocompletewindow.is_active():
+            return None  # the completion window owns the comma
+        self._calltip.try_open_calltip_event(event)
+        return None
 
     def _handle_tab(self, event):
         """Tab: try autocomplete first, fall back to auto-indent."""
@@ -303,7 +351,9 @@ class EditorWidget(tk.Frame):
         """Redirect yscrollcommand from main text to scrollbar + sidebar."""
         self._scrollbar.set(*args)
         if args:
-            self._line_text.yview_moveto(args[0])
+            # Never trust scrollbar fractions when folds are active —
+            # derive the top row from the text widget itself.
+            self._sync_sidebar_yview()
 
     def yview(self, *args):
         result = self._text.yview(*args)
@@ -312,10 +362,17 @@ class EditorWidget(tk.Frame):
         return result
 
     def _sync_sidebar_yview(self):
-        """Match the sidebar scroll position to the main text widget."""
+        """Match the sidebar scroll position to the main text widget.
+
+        Derived from the top display line (works with folds, where
+        scrollbar fractions are unreliable).
+        """
         try:
-            first, _last = self._text.yview()
-            self._line_text.yview_moveto(first)
+            top = int(float(self._text.index('@0,0')))
+            if self._fold.has_folds():
+                top = self._fold.display_line(top)
+            self._line_text.yview(f'{top}.0')
+            self._fold_margin.redraw()
         except tk.TclError:
             pass
 
@@ -427,6 +484,7 @@ class EditorWidget(tk.Frame):
 
     def _update_sidebar_text(self, end):
         """Sync the sidebar Text widget line count with the main editor."""
+        self._fold.mark_dirty()
         if end == self._prev_end:
             return
 
@@ -436,24 +494,53 @@ class EditorWidget(tk.Frame):
             cur_width = int(float(self._line_text['width']))
             self._line_text['width'] = cur_width + width_diff
 
-        # Temporarily enable sidebar text for editing
-        self._line_text.config(state=tk.NORMAL)
-        try:
-            if end > self._prev_end:
-                # Lines added — append new line numbers
-                new_text = '\n'.join(itertools.chain(
-                    [''],
-                    map(str, range(self._prev_end + 1, end + 1)),
-                ))
-                self._line_text.insert('end -1c', new_text, 'linenumber')
-            else:
-                # Lines removed — delete extra line numbers
-                self._line_text.delete(f'{end + 1}.0 -1c', 'end -1c')
-        finally:
-            self._line_text.config(state=tk.DISABLED)
+        if self._fold.has_folds():
+            # Folds renumber the display rows — rebuild compactly.
+            self._rebuild_sidebar_rows()
+        else:
+            # Temporarily enable sidebar text for editing
+            self._line_text.config(state=tk.NORMAL)
+            try:
+                if end > self._prev_end:
+                    # Lines added — append new line numbers
+                    new_text = '\n'.join(itertools.chain(
+                        [''],
+                        map(str, range(self._prev_end + 1, end + 1)),
+                    ))
+                    self._line_text.insert('end -1c', new_text, 'linenumber')
+                else:
+                    # Lines removed — delete extra line numbers
+                    self._line_text.delete(f'{end + 1}.0 -1c', 'end -1c')
+            finally:
+                self._line_text.config(state=tk.DISABLED)
 
         self._prev_end = end
         self._redraw_breakpoint_markers()
+        self._bookmarks.refresh_markers()
+        self._fold_margin.redraw()
+        self._sync_sidebar_yview()
+
+    def _rebuild_sidebar_rows(self):
+        """Rebuild the sidebar row text (compact path, fold-aware)."""
+        if self._fold.has_folds():
+            rows = [str(ln) for ln in self._fold.visible_lines()]
+        else:
+            rows = [str(ln) for ln in
+                    range(1, _get_end_linenumber(self._text) + 1)]
+        self._line_text.config(state=tk.NORMAL)
+        try:
+            self._line_text.delete('1.0', 'end')
+            self._line_text.insert('end', '\n'.join(rows) + '\n', 'linenumber')
+        finally:
+            self._line_text.config(state=tk.DISABLED)
+
+    def refresh_sidebar_for_fold(self):
+        """Full sidebar refresh after fold changes."""
+        self._rebuild_sidebar_rows()
+        self._redraw_breakpoint_markers()
+        self._bookmarks.refresh_markers()
+        self._fold_margin.redraw()
+        self._sync_sidebar_yview()
 
     def _redraw_breakpoint_markers(self):
         """Redraw breakpoint markers in the line-number sidebar."""
@@ -461,9 +548,14 @@ class EditorWidget(tk.Frame):
         try:
             # Clear all breakpoint tags from sidebar
             self._line_text.tag_remove('breakpoint', '1.0', 'end')
-            # Add breakpoint markers
+            # Add breakpoint markers (mapped to display rows when
+            # folding is active; elided lines are skipped).
             for lineno in self._breakpoints:
                 if 1 <= lineno <= self._prev_end:
+                    if self._fold.has_folds():
+                        if self._fold.is_elided(lineno):
+                            continue
+                        lineno = self._fold.display_line(lineno)
                     line_start = f'{lineno}.0'
                     self._line_text.tag_add('breakpoint', line_start,
                                             f'{line_start} lineend')
@@ -473,8 +565,12 @@ class EditorWidget(tk.Frame):
     # ── Smart key handlers ────────────────────────────────────────────────
 
     def _handle_backspace(self, event):
-        """Backspace: use smart backspace if at line-start whitespace."""
-        # Check if we should use smart backspace
+        """Backspace: smart backspace / paired-pair deletion / default."""
+        # Delete both halves of an empty bracket/quote pair first.
+        result = self._smart.paired_backspace(event)
+        if result == 'break':
+            return 'break'
+        # Then use smart backspace at line-start whitespace
         chars = self._text.get("insert linestart", "insert")
         if chars and chars[-1] in ' \t':
             return self._auto_indent.smart_backspace_event(event)
@@ -570,6 +666,8 @@ class EditorWidget(tk.Frame):
         self._undo.set_saved(1)
         # Trigger full recolor (colorizer stays in Percolator chain)
         self._color.recolor_full()
+        # Fold state can't survive a wholesale replace — rescan.
+        self._fold.recompute(keep_state=False)
 
     def get_text_widget(self):
         return self._text
@@ -619,6 +717,8 @@ class EditorWidget(tk.Frame):
         """
         if lineno is None:
             lineno = _get_lineno(self._text, 'insert')
+        if self._fold.is_elided(lineno):
+            self._fold.unfold_containing(lineno)
         if lineno in self._breakpoints:
             self._breakpoints.discard(lineno)
             self._redraw_breakpoint_markers()
@@ -645,9 +745,76 @@ class EditorWidget(tk.Frame):
         """Highlight surrounding brackets (menu / shortcut entry point)."""
         self._paren_match.flash_paren_event()
 
+    # ── Bookmarks ────────────────────────────────────────────────────────
+
+    def _bookmark_toggle_event(self, event=None):
+        self._bookmarks.toggle()
+        return 'break'
+
+    def _bookmark_next_event(self, event=None):
+        self._bookmarks.next()
+        return 'break'
+
+    def _bookmark_prev_event(self, event=None):
+        self._bookmarks.prev()
+        return 'break'
+
     def show_keyword_hint(self):
         """Force-show keyword hint for the word at the cursor."""
         self._keyword_hint.force_show()
+
+    def toggle_code_context(self, event=None):
+        """Show/hide the code context strip."""
+        return self._code_context.toggle_code_context_event(event)
+
+    # ── Folding ──────────────────────────────────────────────────────────
+
+    def toggle_fold(self, event=None):
+        """Fold/unfold the region at the cursor."""
+        lineno = _get_lineno(self._text, 'insert')
+        if not self._fold.toggle(lineno):
+            self._text.bell()
+        return 'break'
+
+    def toggle_fold_all(self, event=None):
+        """Fold all regions, or unfold all when any are folded."""
+        if self._fold.has_folds():
+            self._fold.unfold_all()
+        else:
+            self._fold.fold_all()
+        return 'break'
+
+    # ── SmartKeys facades (menu entry points) ────────────────────────────
+
+    def duplicate_line(self, event=None):
+        return self._smart.duplicate_line_or_selection(event)
+
+    def move_line_up(self, event=None):
+        return self._smart.move_line_up(event)
+
+    def move_line_down(self, event=None):
+        return self._smart.move_line_down(event)
+
+    def join_lines(self, event=None):
+        return self._smart.join_lines(event)
+
+    def expand_selection(self, event=None):
+        return self._smart.expand_selection(event)
+
+    def shrink_selection(self, event=None):
+        return self._smart.shrink_selection(event)
+
+    def toggle_bookmark(self, event=None):
+        self._bookmarks.toggle()
+        return 'break'
+
+    def next_bookmark(self, event=None):
+        self._bookmarks.next()
+        return 'break'
+
+    def prev_bookmark(self, event=None):
+        self._bookmarks.prev()
+        return 'break'
 
     # ── Region operations (IDLE-style) ───────────────────────────────────
 
@@ -656,14 +823,16 @@ class EditorWidget(tk.Frame):
 
         If nothing is selected, uses the cursor line for both.
         """
-        try:
-            first = int(float(self._text.index('sel.first')))
-            last = int(float(self._text.index('sel.last')))
-        except (tk.TclError, ValueError):
+        # The sel.first/sel.last marks always exist, so the sel tag's
+        # ranges are the only reliable presence check.
+        ranges = self._text.tag_ranges('sel')
+        if not ranges:
             first = last = int(float(self._text.index('insert')))
             return first, last
+        first = int(float(self._text.index(ranges[0])))
+        last = int(float(self._text.index(ranges[1])))
         # If selection ends at column 0, it's the line above
-        if self._text.compare('sel.last', '==', f'{last}.0'):
+        if self._text.compare(ranges[1], '==', f'{last}.0'):
             last = max(first, last - 1)
         return first, last
 
@@ -725,6 +894,8 @@ class EditorWidget(tk.Frame):
     def go_to_line(self, lineno):
         """Jump to the given 1-based line number and center it."""
         lineno = max(1, min(lineno, _get_end_linenumber(self._text)))
+        if self._fold.is_elided(lineno):
+            self._fold.unfold_containing(lineno)
         self._text.mark_set('insert', f'{lineno}.0')
         self._text.see(f'{lineno}.0')
         self.center('insert')
@@ -827,6 +998,8 @@ class EditorWidget(tk.Frame):
         try:
             self._cancel_sidebar_autoscroll()
             self._keyword_hint.detach()
+            self._code_context.close()
+            self._fold.cancel()
             self._color.close()
             self._percolator.close()
         except Exception:
