@@ -1,10 +1,9 @@
 """Debugger — ported from idlelib/debugger.py for in-process use.
 
-Provides a GUI debug control panel (ttk.Frame) matching IDLE's
+Provides a GUI debug control window (tk.Toplevel) matching IDLE's
 Debugger window layout exactly.
 
 Based on idlelib's debugger.Debugger, adapted for:
-  - Inline panel (ttk.Frame) instead of separate Toplevel
   - Direct bdb.Bdb instead of Idb proxy
   - tknote's shell integration
 """
@@ -259,14 +258,14 @@ class NamespaceViewer:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Debugger — GUI debug control panel (ttk.Frame)
+# Debugger — GUI debug control window (tk.Toplevel)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class Debugger(ttk.Frame):
-    """GUI debugger panel — ported from idlelib.debugger.Debugger.
+class Debugger(tk.Toplevel):
+    """GUI debugger window — ported from idlelib.debugger.Debugger.
 
-    Matches IDLE's Debugger window layout exactly:
-      - Inline ttk.Frame (instead of Toplevel)
+    A standalone Toplevel window (like IDLE's), shown together with the
+    Python Shell panel while debug mode is active:
       - Direct bdb.Bdb (instead of Idb proxy)
       - tknote shell integration for open_source
     """
@@ -277,19 +276,23 @@ class Debugger(ttk.Frame):
     vglobals = None  # class-level BooleanVar for "Show Globals"
 
     def __init__(self, parent, pyshell, show_header=True, **kwargs):
-        """Create the debugger panel.
+        """Create the standalone Debugger window.
 
-        :param parent: parent widget (usually a PanedWindow or Notebook).
+        :param parent: parent widget (usually the main application window).
         :param pyshell: The PythonShell instance that owns this debugger.
         :param show_header: If False, hide the header bar.
         """
         super().__init__(parent, **kwargs)
+        self.title('Debugger')
+        self.geometry('760x400')
+        self.protocol('WM_DELETE_WINDOW', self._on_close)
         self.pyshell = pyshell
         self._show_header = show_header
         self._close_callback = None
         self.frame = None          # current frame being inspected
         self.interacting = False   # True while waiting for user input
         self.nesting_level = 0     # for re-entrant run detection
+        self.on_interaction = None  # called at each stop (IDLE's wakeup)
 
         # Viewers (matching IDLE's class-level defaults)
         self.stackviewer = None
@@ -327,17 +330,27 @@ class Debugger(ttk.Frame):
     def _user_return(self, frame, retval):
         pass  # silent — IDLE also ignores returns
 
-    # ── Close button ──────────────────────────────────────────────────────
+    # ── Window close ──────────────────────────────────────────────────────
 
     def set_close_callback(self, callback):
         self._close_callback = callback
 
     def _on_close(self):
-        self.pyshell.close_debugger()
+        """Window close (×) — turn debug mode off and destroy."""
+        if self._close_callback:
+            self._close_callback()
+        else:
+            self.pyshell.close_debugger()
+            self.close()
 
     # ── Focus ─────────────────────────────────────────────────────────────
 
     def focus_input(self):
+        try:
+            self.deiconify()
+            self.lift()
+        except tk.TclError:
+            pass
         if self.buttons:
             self.buttons[0].focus_set()
 
@@ -489,8 +502,15 @@ class Debugger(ttk.Frame):
         for b in self.buttons:
             b.configure(state='normal')
 
-        # Nested event loop — vwait (IDLE's exact approach)
+        # Notify the host (IDLE wakes up the debugger window at each stop).
+        if self.on_interaction:
+            self.on_interaction()
+
+        # Nested event loop — vwait (IDLE's exact approach).
+        # Reset the sentinel first so the loop doesn't depend on Tcl
+        # firing write traces when the value doesn't change.
         self.nesting_level += 1
+        self.root.tk.call('set', '::tknote_debug_wait', '0')
         self.root.tk.call('vwait', '::tknote_debug_wait')
         self.nesting_level -= 1
 
@@ -637,28 +657,36 @@ class Debugger(ttk.Frame):
             self._clear_views()
 
     def _clear_views(self):
-        """Clear all viewers when session ends."""
-        if self.stackviewer:
-            self.stackviewer.load_stack([], None)
-        if self.localsviewer:
-            self.localsviewer.load_dict(None)
-        if self.globalsviewer:
-            self.globalsviewer.load_dict(None)
-        self.status.configure(text='')
-        self.error.configure(text='', background=self.errorbg)
+        """Clear all viewers when session ends.
+
+        Tolerates a destroyed window (the user may close it mid-run).
+        """
+        try:
+            if self.stackviewer:
+                self.stackviewer.load_stack([], None)
+            if self.localsviewer:
+                self.localsviewer.load_dict(None)
+            if self.globalsviewer:
+                self.globalsviewer.load_dict(None)
+            self.status.configure(text='')
+            self.error.configure(text='', background=self.errorbg)
+        except tk.TclError:
+            pass
         self.frame = None
 
-    # ── Close (IDLE's close, adapted for inline panel) ────────────────────
+    # ── Close (IDLE's close, adapted for standalone window) ───────────────
 
     def close(self):
-        """Close the debugger — quit bdb and destroy panel."""
+        """Close the debugger — quit bdb and destroy the window.
+
+        Unlike IDLE's close(), never bails out while interacting: the
+        host turns debug mode off (close_debugger → quit) before
+        destroying, which aborts the vwait loop first.
+        """
         try:
             self.quit()
         except Exception:
             pass
-        if self.interacting:
-            self.root.bell()
-            return
         if self.stackviewer:
             self.stackviewer.close()
             self.stackviewer = None
@@ -668,7 +696,10 @@ class Debugger(ttk.Frame):
         if self.globalsviewer:
             self.globalsviewer.close()
             self.globalsviewer = None
-        self.destroy()
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass
 
     # ── Breakpoints ────────────────────────────────────────────────────────
 

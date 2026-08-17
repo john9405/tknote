@@ -7,8 +7,10 @@ import textwrap
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
+from .debugger import Debugger
 from .editor.tabbed import TabbedEditor
 from .editor.widget import EditorWidget
+from .infra.recentfiles import RecentFiles
 from .terminal.shell import PythonShell
 from .terminal.packages import PackageManager
 from .terminal.terminal import SystemTerminal
@@ -25,8 +27,9 @@ class MarkdownEditor:
 
         self.current_folder = None
         self.venv_manager = VenvManager()
-        self._last_search_query = ''
-        self._last_search_case = False
+        self.recent_files = RecentFiles()
+        self._find_dialog = None
+        self._replace_dialog = None
         self.setup_ui()
         self.root.protocol('WM_DELETE_WINDOW', self._on_window_close)
 
@@ -53,6 +56,10 @@ class MarkdownEditor:
         file_menu.add_command(label="Save", command=self.save_file, accelerator="Cmd+S")
         file_menu.add_command(label="Save As", command=self.save_file_as, accelerator="Cmd+Shift+S")
         file_menu.add_separator()
+        file_menu.add_command(label="Open Recent...", command=self.show_recent_files, accelerator="Cmd+E")
+        self._recent_menu = tk.Menu(file_menu, tearoff=0)
+        file_menu.add_cascade(label="Recent Files", menu=self._recent_menu)
+        file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.root.quit)
 
         edit_menu = tk.Menu(menubar, tearoff=0)
@@ -75,6 +82,16 @@ class MarkdownEditor:
         edit_menu.add_command(label="Show Completions", command=self._show_completions, accelerator="Ctrl+Space")
         edit_menu.add_command(label="Show Call Tip", command=self._show_calltip, accelerator="Ctrl+\\")
         edit_menu.add_command(label="Show Surrounding Parens", command=self.flash_paren, accelerator="Ctrl+0")
+        edit_menu.add_command(label="Show Keyword Hint", command=self.show_keyword_hint, accelerator="Ctrl+Shift+K")
+        edit_menu.add_separator()
+        edit_menu.add_command(label="Duplicate Line", command=self.duplicate_line, accelerator="Cmd+D")
+        edit_menu.add_command(label="Move Line Up", command=self.move_line_up, accelerator="Alt+Shift+Up")
+        edit_menu.add_command(label="Move Line Down", command=self.move_line_down, accelerator="Alt+Shift+Down")
+        edit_menu.add_command(label="Join Lines", command=self.join_lines, accelerator="Ctrl+Shift+J")
+        edit_menu.add_command(label="Expand Selection", command=self.expand_selection, accelerator="Ctrl+W")
+        edit_menu.add_command(label="Shrink Selection", command=self.shrink_selection, accelerator="Ctrl+Shift+W")
+        edit_menu.add_separator()
+        edit_menu.add_command(label="Toggle Breakpoint", command=self._toggle_breakpoint, accelerator="F9")
 
         format_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Format", menu=format_menu)
@@ -103,9 +120,20 @@ class MarkdownEditor:
         run_menu.add_separator()
         run_menu.add_command(label="Python Shell", command=self._open_python_shell)
 
+        navigate_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Navigate", menu=navigate_menu)
+        navigate_menu.add_command(label="Go to Line", command=self.show_goto_line, accelerator="Cmd+J")
+        navigate_menu.add_command(label="Toggle Bookmark", command=self.toggle_bookmark, accelerator="F2")
+        navigate_menu.add_command(label="Next Bookmark", command=self.next_bookmark, accelerator="Shift+F2")
+        navigate_menu.add_command(label="Previous Bookmark", command=self.prev_bookmark, accelerator="Alt+F2")
+
         view_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="View", menu=view_menu)
         view_menu.add_command(label="Toggle Bottom Panel", command=self._toggle_bottom_notebook, accelerator="Cmd+Shift+J")
+        view_menu.add_command(label="Toggle Code Context", command=self.toggle_code_context, accelerator="Ctrl+Shift+C")
+        view_menu.add_command(label="Fold / Unfold Current", command=self.toggle_fold, accelerator="Cmd+Alt+[")
+        view_menu.add_command(label="Fold All / Unfold All", command=self.toggle_fold_all, accelerator="Cmd+Alt+]")
+        view_menu.add_command(label="Toggle Line Numbers", command=self.toggle_line_numbers)
 
         help_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Help", menu=help_menu)
@@ -172,7 +200,7 @@ class MarkdownEditor:
         )
         editor_paned.add(self.tabbed_editor, weight=3)
 
-        # -- Bottom notebook (tabs for Shell, Terminal, Debug, Packages) --
+        # -- Bottom notebook (tabs for Shell, Terminal, Packages) --
         cwd = os.path.expanduser('~')
         self._bottom_notebook = ttk.Notebook(editor_paned)
         self._bottom_notebook_shown = False
@@ -182,13 +210,12 @@ class MarkdownEditor:
         self._shell_panel._open_source_callback = self._on_debug_source
         self._pkg_panel = PackageManager(self._bottom_notebook)
         self._sys_term = SystemTerminal(self._bottom_notebook, cwd=cwd, show_header=False)
-        from .debugger import Debugger
-        self._debug_panel = Debugger(self._bottom_notebook, self._shell_panel, show_header=False)
+        self._debug_panel = None  # standalone Debugger window, created lazily
 
         self._bottom_notebook.add(self._shell_panel, text='Python Shell')
         self._bottom_notebook.add(self._sys_term, text='Terminal')
-        self._bottom_notebook.add(self._debug_panel, text='Debug')
         self._bottom_notebook.add(self._pkg_panel, text='Packages')
+        self._refresh_recent_menu()
 
         # -- Status bar --
         status_frame = ttk.Frame(self.root)
@@ -242,6 +269,9 @@ class MarkdownEditor:
         editor.bind("<Command-Shift-S>", lambda _: self.save_file_as())
         editor.bind("<Command-Shift-J>", lambda _: self._toggle_bottom_notebook())
         editor.bind("<Command-f>", lambda _: self.show_find_dialog())
+        editor.bind("<Command-e>", lambda _: self.show_recent_files())
+        editor.bind("<Command-Shift-O>", lambda _: self.open_folder())
+        editor.bind("<F9>", lambda _: self._toggle_breakpoint())
         editor.bind("<Command-g>", lambda _: self.find_again())
         editor.bind("<Command-F3>", lambda _: self.find_selection())
         editor.bind("<Command-Shift-f>", lambda _: self.show_search_dialog())
@@ -317,6 +347,16 @@ class MarkdownEditor:
             except AttributeError:
                 pass
 
+    def _ensure_tab_shown(self, tab_name):
+        """Show the bottom notebook with *tab_name* selected (no toggle)."""
+        if not self._bottom_notebook_shown:
+            self._toggle_bottom_notebook()
+        for i, child in enumerate(self._bottom_notebook.winfo_children()):
+            if self._bottom_notebook.tab(i, 'text') == tab_name:
+                self._bottom_notebook.select(i)
+                break
+        self._update_status_indicators()
+
     def _update_status_indicators(self):
         if self._bottom_notebook_shown:
             self._panel_status.config(text='Panel ▾')
@@ -325,18 +365,36 @@ class MarkdownEditor:
 
     # ---- Debugger ----------------------------------------------------------
 
+    def _open_debugger_window(self):
+        """Create (or show) the standalone Debugger window."""
+        if self._debug_panel is None:
+            self._debug_panel = Debugger(self.root, self._shell_panel)
+            self._debug_panel.on_interaction = self._on_debug_interaction
+            self._debug_panel.set_close_callback(self._close_debugger)
+        try:
+            self._debug_panel.deiconify()
+            self._debug_panel.lift()
+        except tk.TclError:
+            pass
+        return self._debug_panel
+
+    def _close_debugger(self):
+        """Turn debug mode off and destroy the Debugger window."""
+        self._shell_panel.close_debugger()
+        if self._debug_panel is not None:
+            try:
+                self._debug_panel.close()
+            except tk.TclError:
+                pass
+            self._debug_panel = None
+        self._update_status_indicators()
+
     def _toggle_debugger(self):
         if self._shell_panel.is_debugging():
-            self._shell_panel.close_debugger()
-            if self._bottom_notebook_shown:
-                current = self._bottom_notebook.index('current')
-                if self._bottom_notebook.tab(current, 'text') == 'Debug':
-                    self._switch_to_tab('Python Shell')
-            self._update_status_indicators()
+            self._close_debugger()
         else:
-            self._shell_panel.open_debugger(self._debug_panel)
+            self._shell_panel.open_debugger(self._open_debugger_window())
             self._load_breakpoints_to_debugger()
-            self._switch_to_tab('Debug')
 
     def _toggle_breakpoint(self):
         """Toggle a breakpoint on the current cursor line in the active editor."""
@@ -386,6 +444,16 @@ class MarkdownEditor:
             else:
                 dbg.clear_breakpoint(file_path, lineno)
 
+    def _on_debug_interaction(self):
+        """Lift the Debugger window when the debugger stops (IDLE's wakeup)."""
+        if self._debug_panel is None:
+            return
+        try:
+            self._debug_panel.deiconify()
+            self._debug_panel.lift()
+        except tk.TclError:
+            pass
+
     def _on_debug_source(self, filename, lineno):
         """Open a file and jump to a specific line (called by debugger)."""
         self._open_file_in_tab(filename)
@@ -402,6 +470,8 @@ class MarkdownEditor:
 
     def _on_window_close(self):
         """Clean up subprocesses before closing."""
+        self._close_find_dialog()
+        self._close_replace_dialog()
         self._shell_panel.cleanup()
         self._sys_term.cleanup()
         self.root.destroy()
@@ -590,6 +660,8 @@ class MarkdownEditor:
 
     def _open_file_in_tab(self, file_path):
         """Open a file: switch to its tab if already open, otherwise create one."""
+        self.recent_files.add(file_path)
+        self._refresh_recent_menu()
         existing = self.tabbed_editor.find_tab_by_path(file_path)
         if existing >= 0:
             self.tabbed_editor.switch_to_tab(existing)
@@ -736,6 +808,8 @@ class MarkdownEditor:
         )
         if file_path:
             self.tabbed_editor.set_tab_path(tab['id'], file_path)
+            self.recent_files.add(file_path)
+            self._refresh_recent_menu()
             return self._save_to_tab(tab)
         return False
 
@@ -796,11 +870,11 @@ class MarkdownEditor:
 
         source = tab['editor'].get_text()
 
-        self._switch_to_tab('Python Shell')
+        # Show the Python Shell panel and the Debugger window together.
+        self._ensure_tab_shown('Python Shell')
         if not self._shell_panel.is_debugging():
-            self._shell_panel.open_debugger(self._debug_panel)
+            self._shell_panel.open_debugger(self._open_debugger_window())
             self._load_breakpoints_to_debugger()
-        self._switch_to_tab('Debug')
 
         try:
             self.root.update_idletasks()
@@ -930,46 +1004,23 @@ class MarkdownEditor:
 
     def show_replace_dialog(self):
         """Dialog: find and replace text in the current file."""
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Replace")
-        dialog.geometry("420x180")
-        dialog.transient(self.root)
-        dialog.grab_set()
+        editor = self.editor
+        if editor is None:
+            return
+        from .editor.findreplace import ReplaceDialog
+        self._close_replace_dialog()
+        self._replace_dialog = ReplaceDialog(self, editor, 'Replace')
 
-        ttk.Label(dialog, text="Find:").grid(row=0, column=0, sticky='w', padx=10, pady=(10, 2))
-        find_var = tk.StringVar()
-        find_entry = ttk.Entry(dialog, textvariable=find_var)
-        find_entry.grid(row=0, column=1, sticky='ew', padx=(0, 10), pady=(10, 2))
-        find_entry.focus()
+    def _close_find_dialog(self):
+        if self._find_dialog is not None and self._find_dialog.winfo_exists():
+            self._find_dialog.destroy()
+        self._find_dialog = None
 
-        ttk.Label(dialog, text="Replace with:").grid(row=1, column=0, sticky='w', padx=10, pady=2)
-        replace_var = tk.StringVar()
-        replace_entry = ttk.Entry(dialog, textvariable=replace_var)
-        replace_entry.grid(row=1, column=1, sticky='ew', padx=(0, 10), pady=2)
-
-        dialog.grid_columnconfigure(1, weight=1)
-
-        btn_frame = ttk.Frame(dialog)
-        btn_frame.grid(row=2, column=0, columnspan=2, pady=(10, 5))
-
-        def do_replace():
-            query = find_var.get()
-            replacement = replace_var.get()
-            if not query:
-                return
-            editor = self.editor
-            if editor is None:
-                return
-            content = editor.get('1.0', 'end-1c')
-            new_content = content.replace(query, replacement)
-            if new_content != content:
-                editor.set_text(new_content)
-
-        ttk.Button(btn_frame, text="Replace All", command=do_replace).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame, text="Close", command=dialog.destroy).pack(side=tk.LEFT, padx=2)
-
-        find_entry.bind('<Return>', lambda _: do_replace())
-        replace_entry.bind('<Return>', lambda _: do_replace())
+    def _close_replace_dialog(self):
+        if self._replace_dialog is not None and \
+                self._replace_dialog.winfo_exists():
+            self._replace_dialog.destroy()
+        self._replace_dialog = None
 
     def show_about(self):
         """Show About dialog."""
@@ -1028,6 +1079,116 @@ class MarkdownEditor:
             editor.insert(tk.INSERT, "[text](url)")
 
     # ---- Edit operations ---------------------------------------------------
+
+    def duplicate_line(self):
+        editor = self.editor
+        if editor:
+            editor.duplicate_line()
+
+    def move_line_up(self):
+        editor = self.editor
+        if editor:
+            editor.move_line_up()
+
+    def move_line_down(self):
+        editor = self.editor
+        if editor:
+            editor.move_line_down()
+
+    def join_lines(self):
+        editor = self.editor
+        if editor:
+            editor.join_lines()
+
+    def expand_selection(self):
+        editor = self.editor
+        if editor:
+            editor.expand_selection()
+
+    def shrink_selection(self):
+        editor = self.editor
+        if editor:
+            editor.shrink_selection()
+
+    def toggle_bookmark(self):
+        editor = self.editor
+        if editor:
+            editor.toggle_bookmark()
+
+    def next_bookmark(self):
+        editor = self.editor
+        if editor:
+            editor.next_bookmark()
+
+    def prev_bookmark(self):
+        editor = self.editor
+        if editor:
+            editor.prev_bookmark()
+
+    def toggle_code_context(self):
+        editor = self.editor
+        if editor:
+            editor.toggle_code_context()
+
+    def toggle_fold(self):
+        editor = self.editor
+        if editor:
+            editor.toggle_fold()
+
+    def toggle_fold_all(self):
+        editor = self.editor
+        if editor:
+            editor.toggle_fold_all()
+
+    def toggle_line_numbers(self):
+        editor = self.editor
+        if editor:
+            editor.toggle_line_numbers()
+
+    # ---- Recent files -------------------------------------------------------
+
+    def show_recent_files(self):
+        """Quick-open dialog for recently opened files."""
+        paths = self.recent_files.get_paths()
+        if not paths:
+            messagebox.showinfo('Open Recent', 'No recent files.',
+                                parent=self.root)
+            return
+        dialog = tk.Toplevel(self.root)
+        dialog.title('Open Recent')
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        listbox = tk.Listbox(dialog, width=70,
+                             height=min(15, len(paths)))
+        listbox.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        for p in paths:
+            listbox.insert(tk.END, p)
+
+        def open_selected(_event=None):
+            sel = listbox.curselection()
+            if sel:
+                self._open_file_in_tab(paths[sel[0]])
+            dialog.destroy()
+
+        listbox.bind('<Double-Button-1>', open_selected)
+        listbox.bind('<Return>', open_selected)
+        listbox.bind('<Escape>', lambda e: dialog.destroy())
+        listbox.focus_set()
+        listbox.select_set(0)
+
+    def _refresh_recent_menu(self):
+        """Rebuild the Recent Files submenu."""
+        menu = getattr(self, '_recent_menu', None)
+        if menu is None:
+            return
+        menu.delete(0, tk.END)
+        paths = self.recent_files.get_paths()
+        if not paths:
+            menu.add_command(label='(empty)', state=tk.DISABLED)
+            return
+        for p in paths:
+            menu.add_command(label=p, command=lambda p=p: self._open_file_in_tab(p))
 
     def undo(self):
         editor = self.editor
@@ -1254,37 +1415,32 @@ class MarkdownEditor:
     # ---- Search ------------------------------------------------------------
 
     def find_again(self):
-        if not self._last_search_query:
+        """Find the next occurrence of the last search."""
+        dlg = self._find_dialog
+        if dlg is None or not dlg.winfo_exists():
+            self.show_find_dialog()
             return
-        editor = self.editor
-        if editor is None:
-            return
-        query = self._last_search_query
-        case = self._last_search_case
-        nocase = not case
-        try:
-            match = editor.search(f"\\m{re.escape(query)}\\M", "insert", forwards=True, regexp=1, nocase=nocase)
-            if match:
-                editor.mark_set("insert", match)
-                editor.see(match)
-            else:
-                match = editor.search(f"\\m{re.escape(query)}\\M", "1.0", forwards=True, regexp=1, nocase=nocase)
-                if match:
-                    editor.mark_set("insert", match)
-                    editor.see(match)
-        except re.error:
-            pass
+        # Advance past the current hit before searching again.
+        dlg.text.mark_set('insert', 'insert+1c')
+        dlg.find_next(ok=False)
 
     def find_selection(self):
+        """Find the current selection."""
         editor = self.editor
         if editor is None:
             return
         try:
             sel = editor.get(tk.SEL_FIRST, tk.SEL_LAST)
-            if sel:
-                self.find_in_editor(sel)
         except tk.TclError:
-            pass
+            return
+        if not sel:
+            return
+        if self._find_dialog is None or not self._find_dialog.winfo_exists():
+            self.show_find_dialog()
+        dlg = self._find_dialog
+        dlg.engine.patvar.set(sel)
+        dlg.highlight_all()
+        dlg.find_next(ok=False)
 
     def _show_completions(self):
         editor = self.editor
@@ -1294,67 +1450,28 @@ class MarkdownEditor:
     def _show_calltip(self):
         editor = self.editor
         if editor is not None:
-            editor._calltip.try_open_calltip_event(None)
+            editor._calltip.force_open_calltip_event(None)
 
     def show_find_dialog(self):
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Find in File")
-        dialog.geometry("400x120")
-        dialog.transient(self.root)
-        dialog.grab_set()
-
-        ttk.Label(dialog, text="Find:").pack(anchor="w", padx=10, pady=(10, 5))
-
-        search_var = tk.StringVar()
-        search_entry = ttk.Entry(dialog, textvariable=search_var)
-        search_entry.pack(fill=tk.X, padx=10, pady=5)
-        search_entry.focus()
-
-        case_var = tk.BooleanVar()
-
-        options_frame = ttk.Frame(dialog)
-        options_frame.pack(fill=tk.X, padx=10, pady=5)
-        ttk.Checkbutton(options_frame, text="Case sensitive", variable=case_var).pack(side=tk.LEFT)
-
-        button_frame = ttk.Frame(dialog)
-        button_frame.pack(fill=tk.X, padx=10, pady=(5, 10))
-
-        def do_find():
-            query = search_var.get()
-            if not query:
-                return
-            self.find_in_editor(query, case_var.get())
-
-        ttk.Button(button_frame, text="Find", command=do_find).pack(side=tk.RIGHT)
-        ttk.Button(button_frame, text="Close", command=dialog.destroy).pack(side=tk.RIGHT, padx=5)
-
-        search_entry.bind("<Return>", lambda _: do_find())
-
-    def find_in_editor(self, query, case_sensitive=False):
-        self._last_search_query = query
-        self._last_search_case = case_sensitive
+        """Dialog: find text in the current file (engine-backed)."""
         editor = self.editor
         if editor is None:
             return
-        content = editor.get("1.0", tk.END)
-        flags = 0 if case_sensitive else re.IGNORECASE
+        from .editor.findreplace import FindDialog
+        self._close_find_dialog()
+        self._find_dialog = FindDialog(self, editor, 'Find in File')
 
-        editor.tag_remove("found", "1.0", tk.END)
-
-        try:
-            for match in re.finditer(re.escape(query), content, flags):
-                start_idx = f"1.0 + {match.start()} chars"
-                end_idx = f"1.0 + {match.end()} chars"
-                editor.tag_add("found", start_idx, end_idx)
-            editor.tag_config("found", background="yellow", foreground="black")
-
-            first_match = editor.search(f"\\m{re.escape(query)}\\M", "1.0", forwards=True,
-                                        regexp=1, nocase=not case_sensitive)
-            if first_match:
-                editor.mark_set("insert", first_match)
-                editor.see(first_match)
-        except re.error:
-            pass
+    def find_in_editor(self, query, case_sensitive=False):
+        """Find *query* in the active editor (engine-backed)."""
+        editor = self.editor
+        if editor is None:
+            return
+        self.show_find_dialog()
+        dlg = self._find_dialog
+        dlg.engine.patvar.set(query)
+        dlg.engine.casevar.set(case_sensitive)
+        dlg.highlight_all()
+        dlg.find_next(ok=False)
 
     def show_search_dialog(self):
         if not self.current_folder:
